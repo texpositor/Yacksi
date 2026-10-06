@@ -1,12 +1,14 @@
-This is a project to create Yet Another Cave Survey Instrument
+# This is a project to create Yet Another Cave Survey Instrument
 
-Perhaps the main use to others will be the working code for an AliExpress cheap laser range finder module, sometimes called an M01 which took a bit of effort to working, there is only one other example on github from 
+Perhaps the main use to others will be the working code for an AliExpress cheap laser range finder module, sometimes called an M01 which took a bit of effort to working, there is only one other example online which did not work with my module.
+
 This is the module I have - https://manuals.plus/ae/1005009250844924
 This is the other project which did not work with my module - https://github.com/Andres-ros/laser-m01-esp32
 
 
 Below is the basic test code for the M01 laser module (its easier to see what is going on than the main.c which includes coed for other modules as well
 
+```cpp
 // for module m01-v02-20269424
 /*
  * M01 Laser Ranging Module + ESP32
@@ -113,3 +115,4 @@ void loop() {
     }
   }
 }
+```
