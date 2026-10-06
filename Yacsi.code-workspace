@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"name": "Resistivity",
+			"path": "../Resistivity"
+		}
+	],
+	"settings": {}
+}
