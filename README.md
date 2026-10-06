@@ -1,5 +1,7 @@
 # This is a project to create Yet Another Cave Survey Instrument
 
+N.B at the moment this is a very early prototype, so whilst the commit message says its working, it just means that the M01 laser, ADXL355 and RM3100 magnetometer are being read, its not yet a working survey instrument.
+
 Perhaps the main use to others will be the working code for an AliExpress cheap laser range finder module, sometimes called an M01 which took a bit of effort to working, there is only one other example online which did not work with my module.
 
 This is the module I have - https://manuals.plus/ae/1005009250844924
