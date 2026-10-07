@@ -2,6 +2,31 @@
 
 N.B at the moment this is a very early prototype, so whilst the commit message says its working, it just means that the M01 laser, ADXL355 and RM3100 magnetometer are being read, its not yet a working survey instrument.
 
+## Serial commands and calibration
+
+Set the USB serial monitor to 115200 baud. Commands are single characters and
+are case-insensitive:
+
+- `R`: start continuous distance and sensor output.
+- `S`: stop streaming; the device idles and waits for commands.
+- `M`: begin magnetometer calibration. Slowly rotate through all orientations
+  for at least 300 samples, then press any key to fit and save the
+  hard-iron offset and soft-iron matrix. A successful calibration is loaded
+  automatically after restart.
+- `A`: begin six-position accelerometer calibration. Follow the prompts to
+  place each ADXL355 axis pointing up and then pointing down;
+  keep the instrument still and press Enter at each position. Type `q` to
+  cancel. The per-axis offsets and scale factors are saved in non-volatile
+  storage and restored at startup.
+- `X`: erase the saved magnetometer calibration. Bearing output is unavailable
+  until a new magnetometer calibration is completed.
+- `H` or `?`: show the command list.
+
+While streaming, each completed measurement is emitted on one line in the
+format `DIST_MM=...,AX=...,AY=...,AZ=...,MX=...,MY=...,MZ=...,BEARING=...,INCL=...`.
+The X-axis inclination uses all three calibrated accelerometer axes, and the
+compass bearing applies hard/soft-iron and tilt compensation.
+
 Perhaps the main use to others will be the working code for an AliExpress cheap laser range finder module, sometimes called an M01 which took a bit of effort to working, there is only one other example online which did not work with my module.
 
 This is the module I have - https://manuals.plus/ae/1005009250844924
