@@ -2,6 +2,8 @@
 
 N.B at the moment this is a very early prototype, so whilst the commit message says its working, it just means that the M01 laser, ADXL355 and RM3100 magnetometer are being read, its not yet a working survey instrument.
 
+Care is needed in mouting the modules the Axes of the ADXL355 and RM3100 magentometer need to be aligned, X should be forwards along the laser axis, to determine the X axis of the RM3100 take readings as you rotate it and ensure the Max X reading is when the laser is pointing north
+
 ## Serial commands and calibration
 
 Set the USB serial monitor to 115200 baud. Commands are single characters and

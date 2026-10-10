@@ -47,6 +47,11 @@
 // --- M01 Laser Commands ---
 uint8_t measureCmd[] = {0xAA, 0x00, 0x00, 0x20, 0x00, 0x01, 0x00, 0x00, 0x21};
 uint8_t laserOnCmd[] = {0xAA, 0x00, 0x01, 0xBE, 0x00, 0x01, 0x00, 0x01, 0xC1};
+uint8_t laserOffCmd[] = {0xAA, 0x00, 0x01, 0xBE, 0x00, 0x01, 0x00, 0x00, 0xC0};
+
+void turnLaserOff() {
+  Serial1.write(laserOffCmd, sizeof(laserOffCmd));
+}
 
 static inline uint32_t bcd32(const uint8_t* b){
   uint32_t v=0; for(int i=0;i<4;i++){ v=v*100 + ((b[i]>>4)&0x0F)*10 + (b[i]&0x0F); } return v;
@@ -204,6 +209,7 @@ void startAccelerometerCalibration() {
   }
   streaming = false;
   laserState = 0;
+  turnLaserOff();
   accelCalibrationActive = true;
   accelCalibrationStartTime = millis();
   accelPositionSampling = false;
@@ -326,6 +332,7 @@ void startStreaming() {
 void stopStreaming() {
   streaming = false;
   laserState = 0;
+  turnLaserOff();
   Serial.println("STREAMING=0");
 }
 
@@ -336,8 +343,7 @@ void handleCommand(char command) {
       break;
     case 'S':
       if (magCalibrationActive) finishMagnetometerCalibration();
-      if (streaming) stopStreaming();
-      else Serial.println("STREAMING=0");
+      stopStreaming();
       break;
     case 'M':
       startMagnetometerCalibration();
@@ -581,6 +587,13 @@ void eraseMagCalibration() {
   Serial.println("WARNING: Compass bearing unavailable until recalibrated.");
 }
 
+/*
+ * Solve a linear system of equations using Gaussian elimination with partial pivoting.
+ * Used by the magnetometer calibration routine to solve for the calibration matrix.
+ * The input matrix is augmented, with the last column representing the constants.
+ * Returns true if a solution was found, false if the system is singular or ill-conditioned.
+ */
+
 bool solveLinearSystem(float matrix[9][10], int size, float solution[9]) {
   for (int column = 0; column < size; ++column) {
     int pivotRow = column;
@@ -789,6 +802,7 @@ void startMagnetometerCalibration() {
   }
   streaming = false;
   laserState = 0;
+  turnLaserOff();
   magSampleCount = 0;
   magCalibrationActive = true;
   magCalibrationStartTime = millis();
@@ -864,46 +878,72 @@ void serviceMagnetometerCalibration() {
 float getCompassBearing(float rawX, float rawY, float rawZ) {
   if (!magCalibrationValid) return NAN;
 
+  // --- 1. Apply magnetometer calibration (hard-iron + soft-iron) ---
   const float raw[3] = {rawX, rawY, rawZ};
-  float corrected[3] = {0.0f, 0.0f, 0.0f};
+  float m[3] = {0.0f, 0.0f, 0.0f};
   for (int row = 0; row < 3; ++row) {
-    for (int column = 0; column < 3; ++column) {
-      corrected[row] += magMatrix[row][column] *
-                        (raw[column] - magOffset[column]);
+    for (int col = 0; col < 3; ++col) {
+      m[row] += magMatrix[row][col] * (raw[col] - magOffset[col]);
     }
   }
 
-  // Align the magnetometer's PCB axes with the accelerometer frame before
-  // tilt compensation; applying this yaw offset to the final heading alone
-  // only works when the board is level.
-  const float alignedMagX = corrected[1];
-  const float alignedMagY = -corrected[0];
-  const float alignedMagZ = corrected[2];
+  // RM3100 X is aligned with the laser. Its Y axis is reversed relative to
+  // the ADXL355 frame; retain Z as measured so magnetic inclination agrees
+  // with the accelerometer's positive-up axis during pitch compensation.
+  m[1] = -m[1];
 
-  int32_t acceleration[3];
-  readAccelerometer(acceleration);
-  float accel[3];
-  float normSquared = 0.0f;
-  for (int axis = 0; axis < 3; ++axis) {
-    accel[axis] = (acceleration[axis] - accelerometerCalibration.offset[axis]) *
-                  accelerometerCalibration.scale[axis];
-    normSquared += accel[axis] * accel[axis];
+  // --- 2. Read and calibrate accelerometer ---
+  int32_t accelRaw[3];
+  readAccelerometer(accelRaw);
+  float a[3];
+  for (int i = 0; i < 3; ++i) {
+    a[i] = (accelRaw[i] - accelerometerCalibration.offset[i]) *
+           accelerometerCalibration.scale[i];
   }
-  const float normA = sqrtf(normSquared);
-  if (!isfinite(normA) || normA <= 1.0e-6f) return NAN;
-  float pitchArgument = -accel[0] / normA;
-  if (pitchArgument > 1.0f) pitchArgument = 1.0f;
-  if (pitchArgument < -1.0f) pitchArgument = -1.0f;
-  const float pitch = asinf(pitchArgument);
-  const float roll = atan2f(accel[1], accel[2]);
 
-  // Rotate the corrected magnetic vector into the horizontal plane.
-  const float mx2 = alignedMagX * cosf(pitch) +
-                    alignedMagZ * sinf(pitch);
-  const float my2 = alignedMagX * sinf(roll) * sinf(pitch) +
-                    alignedMagY * cosf(roll) -
-                    alignedMagZ * sinf(roll) * cosf(pitch);
-  float heading = atan2f(-my2, mx2) * (180.0f / PI);
+  // --- 3. Normalize both vectors ---
+  float normA = sqrtf(a[0]*a[0] + a[1]*a[1] + a[2]*a[2]);
+  float normM = sqrtf(m[0]*m[0] + m[1]*m[1] + m[2]*m[2]);
+  if (normA < 1e-6f || normM < 1e-6f) return NAN;
+  for (int i = 0; i < 3; ++i) { a[i] /= normA; m[i] /= normM; }
+
+  // --- 4. Build Earth-frame basis ---
+  // Body frame: X=forward, Y=left, Z=up.
+  // When level, the accelerometer reads +1g on Z, so "up" = a, "down" = -a.
+
+  // East = normalize(down × magnetic field) = normalize((-a) × m)
+  float e[3];
+  e[0] = -a[1]*m[2] + a[2]*m[1];
+  e[1] = -a[2]*m[0] + a[0]*m[2];
+  e[2] = -a[0]*m[1] + a[1]*m[0];
+
+  float normE = sqrtf(e[0]*e[0] + e[1]*e[1] + e[2]*e[2]);
+  if (normE < 1e-6f) return NAN;
+  for (int i = 0; i < 3; ++i) e[i] /= normE;
+
+  // North = East × down = e × (-a)
+  float n[3];
+  n[0] = -e[1]*a[2] + e[2]*a[1];
+  n[1] = -e[2]*a[0] + e[0]*a[2];
+  n[2] = -e[0]*a[1] + e[1]*a[0];
+
+  // --- 5. Project the body's forward axis (X) onto the horizontal plane ---
+  float forward[3] = {1.0f, 0.0f, 0.0f};
+  float dot = forward[0]*(-a[0]) + forward[1]*(-a[1]) + forward[2]*(-a[2]);
+  forward[0] -= dot * (-a[0]);
+  forward[1] -= dot * (-a[1]);
+  forward[2] -= dot * (-a[2]);
+  float normF = sqrtf(forward[0]*forward[0] + forward[1]*forward[1] + forward[2]*forward[2]);
+  if (normF < 1e-6f) return NAN;
+  for (int i = 0; i < 3; ++i) forward[i] /= normF;
+
+  // --- 6. Heading = signed angle from North to forward, about the down axis ---
+  float cosAngle = n[0]*forward[0] + n[1]*forward[1] + n[2]*forward[2];
+  float sinAngle = n[0]*(forward[1]*(-a[2]) - forward[2]*(-a[1]))
+                 + n[1]*(forward[2]*(-a[0]) - forward[0]*(-a[2]))
+                 + n[2]*(forward[0]*(-a[1]) - forward[1]*(-a[0]));
+
+  float heading = atan2f(sinAngle, cosAngle) * (180.0f / PI);
   if (heading < 0.0f) heading += 360.0f;
   if (heading >= 360.0f) heading -= 360.0f;
   return heading;
@@ -921,9 +961,8 @@ void setup() {
   digitalWrite(ENA_PIN, HIGH);
   Serial1.begin(9600, SERIAL_8N1, RXD2, TXD2);
   Serial.println("--- M01 Laser Module Initializing ---");
+  turnLaserOff();
   delay(200);
-  Serial1.write(laserOnCmd, sizeof(laserOnCmd));
-  delay(1500);
   while (Serial1.available()) Serial1.read();
 
   // --- SPI Bus Setup ---
@@ -973,6 +1012,7 @@ void serviceStreaming() {
       lastDistanceMm = static_cast<uint16_t>(bcd32(&response[6]));
     }
   }
+  turnLaserOff();
 
   int32_t acceleration[3];
   readAccelerometer(acceleration);
