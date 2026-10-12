@@ -4,10 +4,11 @@ N.B at the moment this is a very early prototype, so whilst the commit message s
 
 Care is needed in mouting the modules the Axes of the ADXL355 and RM3100 magentometer need to be aligned, X should be forwards along the laser axis, to determine the X axis of the RM3100 take readings as you rotate it and ensure the Max X reading is when the laser is pointing north
 
-## Serial commands and calibration
+## Serial and Bluetooth commands and calibration
 
-Set the USB serial monitor to 115200 baud. Commands are single characters and
-are case-insensitive:
+Connect over USB serial at 115200 baud or pair with the Bluetooth Classic
+serial device named `Yacksi`. Commands are single characters and are
+case-insensitive on either connection:
 
 - `R`: start continuous distance and sensor output.
 - `S`: stop streaming; the device idles and waits for commands.
@@ -24,8 +25,10 @@ are case-insensitive:
   until a new magnetometer calibration is completed.
 - `H` or `?`: show the command list.
 
-While streaming, each completed measurement is emitted on one line in the
-format `DIST_MM=...,AX=...,AY=...,AZ=...,MX=...,MY=...,MZ=...,BEARING=...,INCL=...`.
+All device messages continue to be sent to USB serial and are also sent over
+Bluetooth. While streaming, each completed measurement is emitted on one line
+in the format
+`DIST_MM=...,AX=...,AY=...,AZ=...,MX=...,MY=...,MZ=...,BEARING=...,INCL=...`.
 The X-axis inclination uses all three calibrated accelerometer axes, and the
 compass bearing applies hard/soft-iron and tilt compensation.
 

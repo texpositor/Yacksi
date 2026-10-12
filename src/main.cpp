@@ -1,9 +1,41 @@
 #include <Arduino.h>
+#include <BluetoothSerial.h>
 #include <SPI.h>
 #include <Preferences.h>
 #include <math.h>
 #include <ctype.h>
 #include <string.h>
+
+BluetoothSerial SerialBT;
+/*
+* extend the Arduino Print class to support sending messages via both Serial and Bluetooth
+* MessageOutput is constructed with a boolean indicating whether to send messages via Bluetooth
+* or just send over Serial. The write methods are overridden to send the data to both 
+* Serial and Bluetooth if the boolean is true.
+*/
+class MessageOutput : public Print {
+public:
+  explicit MessageOutput(bool sendBluetooth) : sendBluetooth_(sendBluetooth) {}
+
+  size_t write(uint8_t value) override {
+    const size_t bytesWritten = Serial.write(value);
+    if (sendBluetooth_) SerialBT.write(value);
+    return bytesWritten;
+  }
+
+  size_t write(const uint8_t* buffer, size_t size) override {
+    const size_t bytesWritten = Serial.write(buffer, size);
+    if (sendBluetooth_) SerialBT.write(buffer, size);
+    return bytesWritten;
+  }
+
+private:
+  bool sendBluetooth_;
+};
+
+MessageOutput sendMessage(bool sendBluetooth) {
+  return MessageOutput(sendBluetooth);
+}
 
 // --- M01 Laser Module Pins ---
 #define RXD2 33
@@ -48,9 +80,16 @@
 uint8_t measureCmd[] = {0xAA, 0x00, 0x00, 0x20, 0x00, 0x01, 0x00, 0x00, 0x21};
 uint8_t laserOnCmd[] = {0xAA, 0x00, 0x01, 0xBE, 0x00, 0x01, 0x00, 0x01, 0xC1};
 uint8_t laserOffCmd[] = {0xAA, 0x00, 0x01, 0xBE, 0x00, 0x01, 0x00, 0x00, 0xC0};
+uint8_t laserState = 0;
 
 void turnLaserOff() {
   Serial1.write(laserOffCmd, sizeof(laserOffCmd));
+  laserState = 0;
+}
+
+void turnLaserOn() {
+  Serial1.write(laserOnCmd, sizeof(laserOnCmd));
+  laserState = 1;
 }
 
 static inline uint32_t bcd32(const uint8_t* b){
@@ -74,7 +113,7 @@ float magMatrix[3][3] = {
   {0.0f, 0.0f, 1.0f}
 };
 bool magCalibrationValid = false;
-bool streaming = false;
+bool reading = false;
 bool magCalibrationActive = false;
 int32_t magSamples[MAG_CAL_MAX_SAMPLES][3];
 size_t magSampleCount = 0;
@@ -91,7 +130,7 @@ int32_t accelMaximum[3];
 unsigned long lastAccelSampleTime = 0;
 unsigned long accelCalibrationStartTime = 0;
 
-uint8_t laserState = 0;
+uint8_t laserCycleState = 0;
 unsigned long laserDeadline = 0;
 unsigned long nextLaserCycle = 0;
 uint16_t lastDistanceMm = 0;
@@ -117,7 +156,7 @@ uint8_t adxl355_readRegister(uint8_t reg) {
 void initADXL355() {
   // Read device ID first to verify communication
   uint8_t devid = adxl355_readRegister(ADXL355_DEVID_AD);
-  Serial.print("ADXL355 DEVID_AD: 0x"); Serial.println(devid, HEX);
+  sendMessage(true).print("ADXL355 DEVID_AD: 0x"); sendMessage(true).println(devid, HEX);
   
   // Set to standby mode before configuration
   adxl355_writeRegister(ADXL355_POWER_CTL, 0x00);
@@ -132,7 +171,7 @@ void initADXL355() {
   // Leaving default should be fine, but explicitly setting is safer
   // adxl355_writeRegister(ADXL355_FILTER, 0x04); // 125 Hz ODR
   
-  Serial.println("ADXL355 Initialized");
+  sendMessage(true).println("ADXL355 Initialized");
 }
 
 int32_t readADXL355Axis(uint8_t startReg) {
@@ -153,7 +192,7 @@ int32_t readADXL355Axis(uint8_t startReg) {
 
 bool loadAccelerometerCalibration() {
   if (!calibrationPreferences.begin("adxl355", true)) {
-    Serial.println("Could not open accelerometer calibration storage");
+    sendMessage(true).println("Could not open accelerometer calibration storage");
     return false;
   }
 
@@ -166,7 +205,7 @@ bool loadAccelerometerCalibration() {
 
   if (bytesRead != sizeof(storedCalibration) ||
       storedCalibration.magic != ACCEL_CAL_MAGIC) {
-    Serial.println("No saved accelerometer calibration; using raw readings");
+    sendMessage(true).println("No saved accelerometer calibration; using raw readings");
     return false;
   }
 
@@ -174,19 +213,19 @@ bool loadAccelerometerCalibration() {
     if (!isfinite(storedCalibration.offset[axis]) ||
         !isfinite(storedCalibration.scale[axis]) ||
         storedCalibration.scale[axis] <= 0.0f) {
-      Serial.println("Saved accelerometer calibration is invalid; using raw readings");
+      sendMessage(true).println("Saved accelerometer calibration is invalid; using raw readings");
       return false;
     }
   }
 
   accelerometerCalibration = storedCalibration;
-  Serial.println("Loaded accelerometer calibration from non-volatile storage");
+  sendMessage(true).println("Loaded accelerometer calibration from non-volatile storage");
   return true;
 }
 
 bool saveAccelerometerCalibration(const AccelerometerCalibration& calibration) {
   if (!calibrationPreferences.begin("adxl355", false)) {
-    Serial.println("Could not open accelerometer calibration storage");
+    sendMessage(true).println("Could not open accelerometer calibration storage");
     return false;
   }
 
@@ -204,12 +243,12 @@ void readAccelerometer(int32_t readings[3]) {
 
 void startAccelerometerCalibration() {
   if (magCalibrationActive) {
-    Serial.println("Finish magnetometer calibration before starting accelerometer calibration.");
+    sendMessage(true).println("Finish magnetometer calibration before starting accelerometer calibration.");
     return;
   }
-  streaming = false;
-  laserState = 0;
-  turnLaserOff();
+  reading = false;
+  laserCycleState = 0;
+  turnLaserOn();
   accelCalibrationActive = true;
   accelCalibrationStartTime = millis();
   accelPositionSampling = false;
@@ -218,10 +257,10 @@ void startAccelerometerCalibration() {
     accelMinimum[axis] = INT32_MAX;
     accelMaximum[axis] = INT32_MIN;
   }
-  Serial.println("--- Accelerometer calibration ---");
-  Serial.println("Place the instrument on a stable surface; press Enter at each position.");
-  Serial.println("Type q to cancel.");
-  Serial.println("Position 1/6: X axis pointing up");
+  sendMessage(true).println("--- Accelerometer calibration ---");
+  sendMessage(true).println("Place the instrument on a stable surface; press Enter at each position.");
+  sendMessage(true).println("Type q to cancel.");
+  sendMessage(true).println("Position 1/6: X axis pointing up");
 }
 
 void finishAccelerometerCalibration() {
@@ -232,8 +271,9 @@ void finishAccelerometerCalibration() {
   for (int axis = 0; axis < 3; ++axis) {
     halfRange[axis] = (accelMaximum[axis] - accelMinimum[axis]) / 2.0f;
     if (halfRange[axis] <= 0.0f) {
-      Serial.println("Accelerometer calibration failed: an axis had no measurable range.");
+      sendMessage(true).println("Accelerometer calibration failed: an axis had no measurable range.");
       accelCalibrationActive = false;
+      turnLaserOff();
       return;
     }
     newCalibration.offset[axis] =
@@ -245,21 +285,23 @@ void finishAccelerometerCalibration() {
   }
 
   if (!saveAccelerometerCalibration(newCalibration)) {
-    Serial.println("Could not save accelerometer calibration.");
+    sendMessage(true).println("Could not save accelerometer calibration.");
     accelCalibrationActive = false;
+    turnLaserOff();
     return;
   }
 
   accelerometerCalibration = newCalibration;
   accelCalibrationActive = false;
-  Serial.println("Accelerometer calibration complete and saved.");
+  turnLaserOff();
+  sendMessage(true).println("Accelerometer calibration complete and saved.");
   for (int axis = 0; axis < 3; ++axis) {
-    Serial.print("Axis ");
-    Serial.print("XYZ"[axis]);
-    Serial.print(" offset: ");
-    Serial.print(newCalibration.offset[axis], 1);
-    Serial.print(", scale: ");
-    Serial.println(newCalibration.scale[axis], 6);
+    sendMessage(true).print("Axis ");
+    sendMessage(true).print("XYZ"[axis]);
+    sendMessage(true).print(" offset: ");
+    sendMessage(true).print(newCalibration.offset[axis], 1);
+    sendMessage(true).print(", scale: ");
+    sendMessage(true).println(newCalibration.scale[axis], 6);
   }
 }
 
@@ -297,10 +339,10 @@ void serviceAccelerometerCalibration() {
     "Y axis pointing up", "Y axis pointing down",
     "Z axis pointing up", "Z axis pointing down"
   };
-  Serial.print("Position ");
-  Serial.print(accelCalibrationPosition + 1);
-  Serial.print("/6: ");
-  Serial.println(positions[accelCalibrationPosition]);
+  sendMessage(true).print("Position ");
+  sendMessage(true).print(accelCalibrationPosition + 1);
+  sendMessage(true).print("/6: ");
+  sendMessage(true).println(positions[accelCalibrationPosition]);
 }
 
 float calculateInclinationX(const int32_t rawX, const int32_t rawY,
@@ -318,32 +360,32 @@ void startMagnetometerCalibration();
 void finishMagnetometerCalibration();
 void eraseMagCalibration();
 
-void startStreaming() {
+void startReading() {
   if (magCalibrationActive || accelCalibrationActive) {
-    Serial.println("Finish calibration before starting streaming.");
+    sendMessage(true).println("Finish calibration before starting streaming.");
     return;
   }
-  streaming = true;
-  laserState = 0;
+  reading = true;
+  laserCycleState = 0;
   nextLaserCycle = millis();
-  Serial.println("STREAMING=1,DIST_MM,AX,AY,AZ,MX,MY,MZ,BEARING,INCL");
+  sendMessage(true).println("READING: DIST_MM,AX,AY,AZ,MX,MY,MZ,BEARING,INCL");
 }
 
-void stopStreaming() {
-  streaming = false;
-  laserState = 0;
+void stopReading() {
+  reading = false;
+  laserCycleState = 0;
   turnLaserOff();
-  Serial.println("STREAMING=0");
+  sendMessage(true).println("STOPPED");
 }
 
 void handleCommand(char command) {
   switch (toupper(static_cast<unsigned char>(command))) {
     case 'R':
-      startStreaming();
+      startReading();
       break;
     case 'S':
       if (magCalibrationActive) finishMagnetometerCalibration();
-      stopStreaming();
+      stopReading();
       break;
     case 'M':
       startMagnetometerCalibration();
@@ -356,15 +398,15 @@ void handleCommand(char command) {
       break;
     case 'H':
     case '?':
-      Serial.println("Commands: R=stream, S=stop, M=mag calibration, A=accelerometer calibration, X=erase mag calibration, H=help");
+      sendMessage(true).println("Commands: R=read, S=stop, M=mag calibration, A=accelerometer calibration, X=erase mag calibration, H=help");
       break;
     default:
-      Serial.println("Unknown command. Use R, S, M, A, X, or H.");
+      sendMessage(true).println("Unknown command. Use R, S, M, A, X, or H.");
       break;
   }
 }
 
-void processSerialCharacter(char input) {
+void processInputCharacter(char input) {
   if (magCalibrationActive) {
     if (input == '\r' || input == '\n') {
       if (millis() - magCalibrationStartTime < 150) return;
@@ -384,7 +426,8 @@ void processSerialCharacter(char input) {
     if (input == 'q' || input == 'Q' || input == 's' || input == 'S') {
       accelCalibrationActive = false;
       accelPositionSampling = false;
-      Serial.println("Accelerometer calibration stopped; saved calibration unchanged.");
+      turnLaserOff();
+      sendMessage(true).println("Accelerometer calibration stopped; saved calibration unchanged.");
     } else if (input == '\r' || input == '\n') {
       if (millis() - accelCalibrationStartTime < 150) return;
       if (!accelPositionSampling) {
@@ -392,7 +435,7 @@ void processSerialCharacter(char input) {
         accelPositionSampleCount = 0;
         accelPositionSums[0] = accelPositionSums[1] = accelPositionSums[2] = 0;
         lastAccelSampleTime = millis() - ACCEL_CAL_SAMPLE_INTERVAL_MS;
-        Serial.println("Sampling position...");
+        sendMessage(true).println("Sampling position...");
       }
     }
     return;
@@ -402,9 +445,12 @@ void processSerialCharacter(char input) {
   handleCommand(input);
 }
 
-void pollSerialCommands() {
+void pollCommands() {
   while (Serial.available()) {
-    processSerialCharacter(static_cast<char>(Serial.read()));
+    processInputCharacter(static_cast<char>(Serial.read()));
+  }
+  while (SerialBT.available()) {
+    processInputCharacter(static_cast<char>(SerialBT.read()));
   }
 }
 
@@ -429,7 +475,7 @@ uint8_t rm3100_readRegister(uint8_t reg) {
 void initRM3100() {
   // Check Device ID
   uint8_t revid = rm3100_readRegister(RM3100_REVID_REG);
-  Serial.print("RM3100 REVID: 0x"); Serial.println(revid, HEX);
+  sendMessage(true).print("RM3100 REVID: 0x"); sendMessage(true).println(revid, HEX);
 
   // Reset CMM first (required before writing TMRC)
   rm3100_writeRegister(RM3100_CMM_REG, 0x00);
@@ -452,7 +498,7 @@ void initRM3100() {
   rm3100_writeRegister(RM3100_CMM_REG, 0x79);
   delay(10);
   
-  Serial.println("RM3100 Initialized");
+  sendMessage(true).println("RM3100 Initialized");
 }
 
 int32_t readRM3100Axis(uint8_t startReg) {
@@ -478,7 +524,7 @@ bool loadMagCalibration() {
   }
 
   if (!calibrationPreferences.begin("calib", true)) {
-    Serial.println("WARNING: Could not open magnetometer calibration storage; using identity calibration.");
+    sendMessage(true).println("WARNING: Could not open magnetometer calibration storage; using identity calibration.");
     return false;
   }
 
@@ -513,17 +559,17 @@ bool loadMagCalibration() {
       }
     }
     magCalibrationValid = true;
-    Serial.println("Loaded magnetometer calibration from non-volatile storage.");
+    sendMessage(true).println("Loaded magnetometer calibration from non-volatile storage.");
     return true;
   }
 
-  Serial.println("WARNING: No valid magnetometer calibration; using zero offset and identity matrix.");
+  sendMessage(true).println("WARNING: No valid magnetometer calibration; using zero offset and identity matrix.");
   return false;
 }
 
 bool saveMagCalibration(const float offset[3], const float matrix[3][3]) {
   if (!calibrationPreferences.begin("calib", false)) {
-    Serial.println("Could not open magnetometer calibration storage.");
+    sendMessage(true).println("Could not open magnetometer calibration storage.");
     return false;
   }
 
@@ -548,7 +594,7 @@ bool saveMagCalibration(const float offset[3], const float matrix[3][3]) {
 
 void eraseMagCalibration() {
   if (!calibrationPreferences.begin("calib", false)) {
-    Serial.println("Could not open magnetometer calibration storage for erase.");
+    sendMessage(true).println("Could not open magnetometer calibration storage for erase.");
     return;
   }
   bool erased = true;
@@ -574,7 +620,7 @@ void eraseMagCalibration() {
   }
   calibrationPreferences.end();
   if (!erased) {
-    Serial.println("Warning: one or more magnetometer calibration keys could not be erased.");
+    sendMessage(true).println("Warning: one or more magnetometer calibration keys could not be erased.");
   }
   magCalibrationValid = false;
   for (int axis = 0; axis < 3; ++axis) {
@@ -583,8 +629,8 @@ void eraseMagCalibration() {
       magMatrix[axis][column] = axis == column ? 1.0f : 0.0f;
     }
   }
-  Serial.println("Magnetometer calibration erased; using identity calibration.");
-  Serial.println("WARNING: Compass bearing unavailable until recalibrated.");
+  sendMessage(true).println("Magnetometer calibration erased; using identity calibration.");
+  sendMessage(true).println("WARNING: Compass bearing unavailable until recalibrated.");
 }
 
 /*
@@ -797,40 +843,41 @@ bool fitMagnetometerCalibration(float offset[3], float matrix[3][3]) {
 
 void startMagnetometerCalibration() {
   if (accelCalibrationActive) {
-    Serial.println("Finish accelerometer calibration before starting magnetometer calibration.");
+    sendMessage(true).println("Finish accelerometer calibration before starting magnetometer calibration.");
     return;
   }
-  streaming = false;
-  laserState = 0;
-  turnLaserOff();
+  reading = false;
+  laserCycleState = 0;
+  turnLaserOn();
   magSampleCount = 0;
   magCalibrationActive = true;
   magCalibrationStartTime = millis();
   lastMagSampleTime = magCalibrationStartTime - MAG_CAL_SAMPLE_INTERVAL_MS;
-  Serial.println("--- Magnetometer calibration ---");
-  Serial.println("Slowly rotate the instrument through all orientations; aim for 300-500 samples.");
-  Serial.println("Press any key or S to finish and fit the calibration.");
+  sendMessage(true).println("--- Magnetometer calibration ---");
+  sendMessage(true).println("Slowly rotate the instrument through all orientations; aim for 300-500 samples.");
+  sendMessage(true).println("Press any key or S to finish and fit the calibration.");
 }
 
 void finishMagnetometerCalibration() {
   magCalibrationActive = false;
-  Serial.print("Collected magnetometer samples: ");
-  Serial.println(static_cast<unsigned int>(magSampleCount));
+  turnLaserOff();
+  sendMessage(true).print("Collected magnetometer samples: ");
+  sendMessage(true).println(static_cast<unsigned int>(magSampleCount));
   if (magSampleCount < MAG_CAL_MIN_SAMPLES) {
-    Serial.print("Calibration failed: at least ");
-    Serial.print(MAG_CAL_MIN_SAMPLES);
-    Serial.println(" samples are required; existing calibration was not changed.");
+    sendMessage(true).print("Calibration failed: at least ");
+    sendMessage(true).print(MAG_CAL_MIN_SAMPLES);
+    sendMessage(true).println(" samples are required; existing calibration was not changed.");
     return;
   }
 
   float newOffset[3];
   float newMatrix[3][3] = {};
   if (!fitMagnetometerCalibration(newOffset, newMatrix)) {
-    Serial.println("Magnetometer ellipsoid fit failed (insufficient orientation coverage or singular fit); existing calibration was not changed.");
+    sendMessage(true).println("Magnetometer ellipsoid fit failed (insufficient orientation coverage or singular fit); existing calibration was not changed.");
     return;
   }
   if (!saveMagCalibration(newOffset, newMatrix)) {
-    Serial.println("Could not save magnetometer calibration; existing calibration was not changed.");
+    sendMessage(true).println("Could not save magnetometer calibration; existing calibration was not changed.");
     return;
   }
 
@@ -841,17 +888,17 @@ void finishMagnetometerCalibration() {
     }
   }
   magCalibrationValid = true;
-  Serial.print("Magnetometer hard-iron offset: ");
-  Serial.print(magOffset[0], 3); Serial.print(", ");
-  Serial.print(magOffset[1], 3); Serial.print(", ");
-  Serial.println(magOffset[2], 3);
-  Serial.println("Magnetometer soft-iron matrix:");
+  sendMessage(true).print("Magnetometer hard-iron offset: ");
+  sendMessage(true).print(magOffset[0], 3); sendMessage(true).print(", ");
+  sendMessage(true).print(magOffset[1], 3); sendMessage(true).print(", ");
+  sendMessage(true).println(magOffset[2], 3);
+  sendMessage(true).println("Magnetometer soft-iron matrix:");
   for (int row = 0; row < 3; ++row) {
-    Serial.print(magMatrix[row][0], 8); Serial.print(", ");
-    Serial.print(magMatrix[row][1], 8); Serial.print(", ");
-    Serial.println(magMatrix[row][2], 8);
+    sendMessage(true).print(magMatrix[row][0], 8); sendMessage(true).print(", ");
+    sendMessage(true).print(magMatrix[row][1], 8); sendMessage(true).print(", ");
+    sendMessage(true).println(magMatrix[row][2], 8);
   }
-  Serial.println("Magnetometer calibration saved.");
+  sendMessage(true).println("Magnetometer calibration saved.");
 }
 
 void serviceMagnetometerCalibration() {
@@ -870,7 +917,7 @@ void serviceMagnetometerCalibration() {
   magSamples[magSampleCount][2] = readRM3100Axis(RM3100_MX2_REG + 6);
   ++magSampleCount;
   if (magSampleCount == MAG_CAL_MAX_SAMPLES) {
-    Serial.println("Sample buffer full; fitting calibration.");
+    sendMessage(true).println("Sample buffer full; fitting calibration.");
     finishMagnetometerCalibration();
   }
 }
@@ -954,13 +1001,16 @@ float getCompassBearing(float rawX, float rawY, float rawZ) {
 // ============================================================
 void setup() {
   Serial.begin(115200);
+  if (!SerialBT.begin("Yacksi")) {
+    sendMessage(true).println("Bluetooth initialization failed; serial remains available.");
+  }
   delay(1000);
   
   // --- M01 Laser Setup ---
   pinMode(ENA_PIN, OUTPUT);
   digitalWrite(ENA_PIN, HIGH);
   Serial1.begin(9600, SERIAL_8N1, RXD2, TXD2);
-  Serial.println("--- M01 Laser Module Initializing ---");
+  sendMessage(true).println("--- M01 Laser Module Initializing ---");
   turnLaserOff();
   delay(200);
   while (Serial1.available()) Serial1.read();
@@ -979,28 +1029,28 @@ void setup() {
   loadAccelerometerCalibration();
   loadMagCalibration();
   
-  Serial.println("--- System Ready ---");
-  Serial.println("Commands: R=stream, S=stop, M=mag calibration, A=accelerometer calibration, X=erase mag calibration, H=help.");
+  sendMessage(true).println("--- System Ready ---");
+  sendMessage(true).println("Commands: R=stream, S=stop, M=mag calibration, A=accelerometer calibration, X=erase mag calibration, H=help.");
 }
 
 void serviceStreaming() {
-  if (!streaming) return;
+  if (!reading) return;
   const unsigned long now = millis();
-  if (laserState == 0) {
+  if (laserCycleState == 0) {
     if (now < nextLaserCycle) return;
     while (Serial1.available()) Serial1.read();
-    Serial1.write(laserOnCmd, sizeof(laserOnCmd));
+    turnLaserOn();
     laserDeadline = now + 500;
-    laserState = 1;
+    laserCycleState = 1;
     return;
   }
 
-  if (laserState == 1) {
+  if (laserCycleState == 1) {
     if (now < laserDeadline) return;
     while (Serial1.available()) Serial1.read();
     Serial1.write(measureCmd, sizeof(measureCmd));
     laserDeadline = now + 2500;
-    laserState = 2;
+    laserCycleState = 2;
     return;
   }
   if (now < laserDeadline) return;
@@ -1012,8 +1062,7 @@ void serviceStreaming() {
       lastDistanceMm = static_cast<uint16_t>(bcd32(&response[6]));
     }
   }
-  turnLaserOff();
-
+  
   int32_t acceleration[3];
   readAccelerometer(acceleration);
   const int32_t ax = acceleration[0];
@@ -1026,22 +1075,23 @@ void serviceStreaming() {
     static_cast<float>(mx), static_cast<float>(my), static_cast<float>(mz));
   const float inclination = calculateInclinationX(ax, ay, az);
 
-  Serial.print("DIST_MM="); Serial.print(lastDistanceMm);
-  Serial.print(",AX="); Serial.print(ax);
-  Serial.print(",AY="); Serial.print(ay);
-  Serial.print(",AZ="); Serial.print(az);
-  Serial.print(",MX="); Serial.print(mx);
-  Serial.print(",MY="); Serial.print(my);
-  Serial.print(",MZ="); Serial.print(mz);
-  Serial.print(",BEARING="); Serial.print(bearing, 1);
-  Serial.print(",INCL="); Serial.println(inclination, 1);
+  sendMessage(true).print("DIST_MM="); sendMessage(true).print(lastDistanceMm);
+  sendMessage(true).print(",AX="); sendMessage(true).print(ax);
+  sendMessage(true).print(",AY="); sendMessage(true).print(ay);
+  sendMessage(true).print(",AZ="); sendMessage(true).print(az);
+  sendMessage(true).print(",MX="); sendMessage(true).print(mx);
+  sendMessage(true).print(",MY="); sendMessage(true).print(my);
+  sendMessage(true).print(",MZ="); sendMessage(true).print(mz);
+  sendMessage(true).print(",BEARING="); sendMessage(true).print(bearing, 1);
+  sendMessage(true).print(",INCL="); sendMessage(true).println(inclination, 1);
 
-  laserState = 0;
+  turnLaserOff();
+  laserCycleState = 0;
   nextLaserCycle = millis() + 1000;
 }
 
 void loop() {
-  pollSerialCommands();
+  pollCommands();
   serviceAccelerometerCalibration();
   serviceMagnetometerCalibration();
   serviceStreaming();
