@@ -38,7 +38,14 @@ This is the module I have - https://manuals.plus/ae/1005009250844924
 This is the other project which did not work with my module - https://github.com/Andres-ros/laser-m01-esp32
 
 
-Below is the basic test code for the M01 laser module (its easier to see what is going on than the main.c which includes coed for other modules as well
+Below is the basic test code for the M01 laser module (it's easier to see what is going on than `src/main.cpp`, which includes code for the other modules as well).
+
+The RM3100 rotation-capture test in `test/magTest.cpp` is available as a
+PlatformIO environment. Build it with `pio run -e YacksiMagTest`, or upload it
+with `pio run -e YacksiMagTest -t upload`. Connect over serial at 115200 baud:
+send `R` to collect up to 5000 X/Y/Z samples in RAM, `S` to stop and dump the
+buffer, and `C` to zero the buffer. Sending `S` again dumps the same buffer
+again. The default `Yacksi` environment continues to build the main firmware.
 
 ```cpp
 // for module m01-v02-20269424

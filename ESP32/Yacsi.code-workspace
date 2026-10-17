@@ -4,8 +4,8 @@
 			"path": "."
 		},
 		{
-			"name": "Resistivity",
-			"path": "../Resistivity"
+			"name": "Yacsi",
+			"path": "../Yacsi"
 		}
 	],
 	"settings": {}
