@@ -22,8 +22,8 @@ enum class AppMode {
 data class YacsiUiState(
     val connectionState: ConnectionState = ConnectionState.DISCONNECTED,
     val connectedDeviceName: String? = null,
+    val isAutoReconnectEnabled: Boolean = false,
     val appMode: AppMode = AppMode.NORMAL,
-    val isRunning: Boolean = false,
     val latestReading: YacsiReading? = null,
     val rawLogs: List<String> = emptyList(),
     val warningMessage: String? = null
@@ -40,14 +40,19 @@ class YacsiViewModel : ViewModel() {
             launch {
                 bluetoothService.connectionState.collect { state ->
                     _uiState.update { it.copy(connectionState = state) }
-                    if (state == ConnectionState.DISCONNECTED) {
-                        _uiState.update { it.copy(isRunning = false, appMode = AppMode.NORMAL) }
+                    if (state == ConnectionState.DISCONNECTED && !_uiState.value.isAutoReconnectEnabled) {
+                        _uiState.update { it.copy(appMode = AppMode.NORMAL) }
                     }
                 }
             }
             launch {
                 bluetoothService.connectedDeviceName.collect { name ->
                     _uiState.update { it.copy(connectedDeviceName = name) }
+                }
+            }
+            launch {
+                bluetoothService.isAutoReconnectEnabled.collect { enabled ->
+                    _uiState.update { it.copy(isAutoReconnectEnabled = enabled) }
                 }
             }
             launch {
@@ -58,36 +63,41 @@ class YacsiViewModel : ViewModel() {
         }
     }
 
+    @android.annotation.SuppressLint("MissingPermission")
+    fun autoConnectDefaultDevice() {
+        if (_uiState.value.connectionState == ConnectionState.DISCONNECTED && !_uiState.value.isAutoReconnectEnabled) {
+            val defaultDevice = bluetoothService.getBondedDevices().firstOrNull {
+                it.name?.equals("Yacksi", ignoreCase = true) == true
+            }
+            if (defaultDevice != null) {
+                connect(defaultDevice)
+            }
+        }
+    }
+
     fun getBondedDevices(): Set<BluetoothDevice> {
         return bluetoothService.getBondedDevices()
     }
 
     fun connect(device: BluetoothDevice) {
-        bluetoothService.connect(device)
+        bluetoothService.connect(device, autoReconnect = true)
     }
 
     fun disconnect() {
-        bluetoothService.disconnect()
+        bluetoothService.disconnect(stopAutoReconnect = true)
     }
 
-    fun toggleRun() {
+    fun takeReading() {
         val state = _uiState.value
         if (state.connectionState != ConnectionState.CONNECTED) return
 
         if (state.appMode != AppMode.NORMAL) {
-            _uiState.update { it.copy(warningMessage = "Cannot change Run/Stop state while in calibration mode.") }
+            _uiState.update { it.copy(warningMessage = "Cannot take reading while in calibration mode.") }
             return
         }
 
-        if (state.isRunning) {
-            // Stop
-            bluetoothService.sendCommand("S")
-            _uiState.update { it.copy(isRunning = false) }
-        } else {
-            // Run
-            bluetoothService.sendCommand("R")
-            _uiState.update { it.copy(isRunning = true) }
-        }
+        bluetoothService.sendCommand("R")
+        appendLog(">>> Sent Take Reading (R)")
     }
 
     fun startAccelCalibration() {
@@ -96,8 +106,7 @@ class YacsiViewModel : ViewModel() {
         bluetoothService.sendCommand("A")
         _uiState.update {
             it.copy(
-                appMode = AppMode.ACCEL_CALIBRATION,
-                isRunning = false
+                appMode = AppMode.ACCEL_CALIBRATION
             )
         }
         appendLog(">>> Sent Accel Calibration (A)")
@@ -109,8 +118,7 @@ class YacsiViewModel : ViewModel() {
         bluetoothService.sendCommand("M")
         _uiState.update {
             it.copy(
-                appMode = AppMode.MAG_CALIBRATION,
-                isRunning = false
+                appMode = AppMode.MAG_CALIBRATION
             )
         }
         appendLog(">>> Sent Mag Calibration (M)")
@@ -127,19 +135,6 @@ class YacsiViewModel : ViewModel() {
         // Sends \r for accelerometer calibration step
         bluetoothService.sendCommand("\r")
         appendLog(">>> Sent Enter (\\r)")
-    }
-
-    fun sendMagCalibrationFinish() {
-        // Sends S to finish mag calibration
-        bluetoothService.sendCommand("S")
-        _uiState.update { it.copy(appMode = AppMode.NORMAL) }
-        appendLog(">>> Sent Finish Magnetometer Calibration (S)")
-    }
-
-    fun cancelCalibration() {
-        bluetoothService.sendCommand("q")
-        _uiState.update { it.copy(appMode = AppMode.NORMAL) }
-        appendLog(">>> Cancelled calibration (q)")
     }
 
     fun sendHelp() {
@@ -161,9 +156,8 @@ class YacsiViewModel : ViewModel() {
 
         // Check calibration completion or state cues from device
         val upper = line.uppercase()
-        if (upper.contains("CALIBRATION COMPLETE") || upper.contains("OFFSET") && _uiState.value.appMode == AppMode.MAG_CALIBRATION) {
-            // Check if mag cal finished or accel cal finished
-            if (_uiState.value.appMode == AppMode.ACCEL_CALIBRATION && upper.contains("SAVED")) {
+        if (upper.contains("CALIBRATION COMPLETE") || upper.contains("OFFSET") || upper.contains("SAVED")) {
+            if (_uiState.value.appMode != AppMode.NORMAL) {
                 _uiState.update { it.copy(appMode = AppMode.NORMAL) }
             }
         }

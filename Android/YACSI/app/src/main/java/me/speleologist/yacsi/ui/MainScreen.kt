@@ -6,11 +6,14 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -31,6 +34,7 @@ fun MainScreen(
     var showEraseConfirmDialog by remember { mutableStateOf(false) }
 
     val listState = rememberLazyListState()
+    val clipboardManager = LocalClipboardManager.current
 
     // Auto-scroll logs to bottom when new lines arrive
     LaunchedEffect(uiState.rawLogs.size) {
@@ -94,18 +98,26 @@ fun MainScreen(
                 title = {
                     Column {
                         Text("YACSI - Cave Survey")
-                        Text(
-                            text = when (uiState.connectionState) {
-                                ConnectionState.DISCONNECTED -> "Disconnected"
-                                ConnectionState.CONNECTING -> "Connecting…"
-                                ConnectionState.CONNECTED -> "Connected to ${uiState.connectedDeviceName ?: "Yacksi"}"
-                            },
-                            style = MaterialTheme.typography.bodySmall,
-                            color = when (uiState.connectionState) {
-                                ConnectionState.CONNECTED -> MaterialTheme.colorScheme.primary
-                                ConnectionState.CONNECTING -> MaterialTheme.colorScheme.secondary
-                                ConnectionState.DISCONNECTED -> MaterialTheme.colorScheme.error
+                        val statusText = when (uiState.connectionState) {
+                            ConnectionState.CONNECTED -> "Connected to ${uiState.connectedDeviceName ?: "Yacksi"}"
+                            ConnectionState.CONNECTING -> "Connecting to ${uiState.connectedDeviceName ?: "Yacksi"}…"
+                            ConnectionState.DISCONNECTED -> {
+                                if (uiState.isAutoReconnectEnabled) {
+                                    "Auto-reconnecting to ${uiState.connectedDeviceName ?: "Yacksi"}…"
+                                } else {
+                                    "Disconnected"
+                                }
                             }
+                        }
+                        val statusColor = when {
+                            uiState.connectionState == ConnectionState.CONNECTED -> MaterialTheme.colorScheme.primary
+                            uiState.connectionState == ConnectionState.CONNECTING || uiState.isAutoReconnectEnabled -> MaterialTheme.colorScheme.secondary
+                            else -> MaterialTheme.colorScheme.error
+                        }
+                        Text(
+                            text = statusText,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = statusColor
                         )
                     }
                 },
@@ -113,10 +125,12 @@ fun MainScreen(
                     // Connect / Disconnect button
                     val isConnected = uiState.connectionState == ConnectionState.CONNECTED
                     val isConnecting = uiState.connectionState == ConnectionState.CONNECTING
+                    val isAutoConnecting = uiState.connectionState == ConnectionState.DISCONNECTED && uiState.isAutoReconnectEnabled
+                    val isActiveState = isConnected || isConnecting || isAutoConnecting
 
                     Button(
                         onClick = {
-                            if (isConnected || isConnecting) {
+                            if (isActiveState) {
                                 viewModel.disconnect()
                             } else {
                                 onRequestPermissions()
@@ -125,18 +139,22 @@ fun MainScreen(
                         },
                         colors = ButtonDefaults.buttonColors(
                             containerColor = if (isConnected) MaterialTheme.colorScheme.errorContainer
+                            else if (isConnecting || isAutoConnecting) MaterialTheme.colorScheme.secondaryContainer
                             else MaterialTheme.colorScheme.primary
                         ),
                         modifier = Modifier.padding(end = 8.dp)
                     ) {
                         Text(
-                            text = when (uiState.connectionState) {
-                                ConnectionState.CONNECTED -> "Disconnect"
-                                ConnectionState.CONNECTING -> "Cancel"
-                                ConnectionState.DISCONNECTED -> "Connect"
+                            text = when {
+                                isConnected -> "Disconnect"
+                                isConnecting || isAutoConnecting -> "Cancel"
+                                else -> "Connect"
                             },
-                            color = if (isConnected) MaterialTheme.colorScheme.onErrorContainer
-                            else MaterialTheme.colorScheme.onPrimary
+                            color = when {
+                                isConnected -> MaterialTheme.colorScheme.onErrorContainer
+                                isConnecting || isAutoConnecting -> MaterialTheme.colorScheme.onSecondaryContainer
+                                else -> MaterialTheme.colorScheme.onPrimary
+                            }
                         )
                     }
 
@@ -208,34 +226,17 @@ fun MainScreen(
                             text = if (uiState.appMode == AppMode.ACCEL_CALIBRATION)
                                 "Place device in requested orientation and press Continue."
                             else
-                                "Rotate instrument through all orientations continuously, then press Finish.",
+                                "Rotate instrument through all orientations continuously until complete.",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onTertiaryContainer
                         )
-                        Spacer(modifier = Modifier.height(12.dp))
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            if (uiState.appMode == AppMode.ACCEL_CALIBRATION) {
-                                Button(
-                                    onClick = { viewModel.sendCalibrationContinue() },
-                                    modifier = Modifier.weight(1f)
-                                ) {
-                                    Text("Continue to Next Position")
-                                }
-                            } else {
-                                Button(
-                                    onClick = { viewModel.sendMagCalibrationFinish() },
-                                    modifier = Modifier.weight(1f)
-                                ) {
-                                    Text("Finish Calibration (S)")
-                                }
-                            }
-                            OutlinedButton(
-                                onClick = { viewModel.cancelCalibration() }
+                        if (uiState.appMode == AppMode.ACCEL_CALIBRATION) {
+                            Spacer(modifier = Modifier.height(12.dp))
+                            Button(
+                                onClick = { viewModel.sendCalibrationContinue() },
+                                modifier = Modifier.fillMaxWidth()
                             ) {
-                                Text("Cancel")
+                                Text("Continue to Next Position")
                             }
                         }
                     }
@@ -301,21 +302,20 @@ fun MainScreen(
                 }
             }
 
-            // Run / Stop Toggle Button
+            // Take Reading Button
             val isConnected = uiState.connectionState == ConnectionState.CONNECTED
             Button(
-                onClick = { viewModel.toggleRun() },
+                onClick = { viewModel.takeReading() },
                 enabled = isConnected && uiState.appMode == AppMode.NORMAL,
                 colors = ButtonDefaults.buttonColors(
-                    containerColor = if (uiState.isRunning) MaterialTheme.colorScheme.error
-                    else MaterialTheme.colorScheme.primary
+                    containerColor = MaterialTheme.colorScheme.primary
                 ),
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(50.dp)
             ) {
                 Text(
-                    text = if (uiState.isRunning) "Stop Readings (S)" else "Start Continuous Readings (R)",
+                    text = "Take Reading (R)",
                     style = MaterialTheme.typography.titleMedium
                 )
             }
@@ -328,11 +328,32 @@ fun MainScreen(
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
             ) {
                 Column(modifier = Modifier.fillMaxSize().padding(8.dp)) {
-                    Text(
-                        text = "Output Log",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Output Log",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        if (uiState.rawLogs.isNotEmpty()) {
+                            IconButton(
+                                onClick = {
+                                    clipboardManager.setText(AnnotatedString(uiState.rawLogs.joinToString("\n")))
+                                },
+                                modifier = Modifier.size(24.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.ContentCopy,
+                                    contentDescription = "Copy Output Log",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+                        }
+                    }
                     Spacer(modifier = Modifier.height(4.dp))
                     Box(
                         modifier = Modifier

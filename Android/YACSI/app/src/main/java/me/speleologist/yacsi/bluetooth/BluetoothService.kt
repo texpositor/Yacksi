@@ -8,6 +8,7 @@ import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -39,11 +40,16 @@ class BluetoothService {
     private val _connectedDeviceName = MutableStateFlow<String?>(null)
     val connectedDeviceName: StateFlow<String?> = _connectedDeviceName.asStateFlow()
 
+    private val _isAutoReconnectEnabled = MutableStateFlow(false)
+    val isAutoReconnectEnabled: StateFlow<Boolean> = _isAutoReconnectEnabled.asStateFlow()
+
     private val _receivedLines = MutableSharedFlow<String>(replay = 50, extraBufferCapacity = 200)
     val receivedLines: SharedFlow<String> = _receivedLines.asSharedFlow()
 
     private var socket: BluetoothSocket? = null
     private var readJob: Job? = null
+    private var reconnectJob: Job? = null
+    private var targetDevice: BluetoothDevice? = null
     private val serviceScope = CoroutineScope(Dispatchers.IO + Job())
 
     fun getBondedDevices(): Set<BluetoothDevice> {
@@ -56,31 +62,56 @@ class BluetoothService {
     }
 
     @SuppressLint("MissingPermission")
-    fun connect(device: BluetoothDevice) {
-        if (_connectionState.value == ConnectionState.CONNECTING || _connectionState.value == ConnectionState.CONNECTED) {
-            disconnect()
+    fun connect(device: BluetoothDevice, autoReconnect: Boolean = true) {
+        targetDevice = device
+        _isAutoReconnectEnabled.value = autoReconnect
+        _connectedDeviceName.value = device.name ?: device.address
+
+        reconnectJob?.cancel()
+        reconnectJob = serviceScope.launch {
+            connectInternal(device)
         }
+    }
+
+    @SuppressLint("MissingPermission")
+    private suspend fun connectInternal(device: BluetoothDevice) {
+        closeSocketOnly()
 
         _connectionState.value = ConnectionState.CONNECTING
         _connectedDeviceName.value = device.name ?: device.address
 
-        serviceScope.launch {
-            try {
-                val tmpSocket = device.createRfcommSocketToServiceRecord(SPP_UUID)
-                socket = tmpSocket
-                // Cancel discovery if running to speed up connection
-                bluetoothAdapter?.cancelDiscovery()
+        try {
+            val tmpSocket = device.createRfcommSocketToServiceRecord(SPP_UUID)
+            socket = tmpSocket
+            // Cancel discovery if running to speed up connection
+            bluetoothAdapter?.cancelDiscovery()
 
-                tmpSocket.connect()
+            tmpSocket.connect()
 
-                withContext(Dispatchers.Main) {
-                    _connectionState.value = ConnectionState.CONNECTED
-                }
+            withContext(Dispatchers.Main) {
+                _connectionState.value = ConnectionState.CONNECTED
+            }
 
-                startReading(tmpSocket)
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to connect to device ${device.address}", e)
-                disconnect()
+            startReading(tmpSocket)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to connect to device ${device.address}: ${e.message}")
+            closeSocketOnly()
+            _connectionState.value = ConnectionState.DISCONNECTED
+
+            if (_isAutoReconnectEnabled.value && targetDevice != null) {
+                scheduleAutoReconnect()
+            }
+        }
+    }
+
+    private fun scheduleAutoReconnect() {
+        reconnectJob?.cancel()
+        reconnectJob = serviceScope.launch {
+            delay(2500)
+            val dev = targetDevice
+            if (dev != null && _isAutoReconnectEnabled.value && _connectionState.value == ConnectionState.DISCONNECTED) {
+                Log.d(TAG, "Attempting auto-reconnect to ${dev.address}...")
+                connectInternal(dev)
             }
         }
     }
@@ -113,7 +144,7 @@ class BluetoothService {
             } catch (e: Exception) {
                 Log.e(TAG, "Error reading from Bluetooth socket", e)
             } finally {
-                disconnect()
+                onConnectionLost()
             }
         }
     }
@@ -135,12 +166,24 @@ class BluetoothService {
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to send command: $command", e)
-                disconnect()
+                onConnectionLost()
             }
         }
     }
 
-    fun disconnect() {
+    private fun onConnectionLost() {
+        closeSocketOnly()
+        serviceScope.launch(Dispatchers.Main) {
+            _connectionState.value = ConnectionState.DISCONNECTED
+            if (_isAutoReconnectEnabled.value && targetDevice != null) {
+                scheduleAutoReconnect()
+            } else {
+                _connectedDeviceName.value = null
+            }
+        }
+    }
+
+    private fun closeSocketOnly() {
         readJob?.cancel()
         readJob = null
         try {
@@ -149,6 +192,16 @@ class BluetoothService {
             Log.e(TAG, "Error closing socket", e)
         }
         socket = null
+    }
+
+    fun disconnect(stopAutoReconnect: Boolean = true) {
+        if (stopAutoReconnect) {
+            _isAutoReconnectEnabled.value = false
+            reconnectJob?.cancel()
+            reconnectJob = null
+            targetDevice = null
+        }
+        closeSocketOnly()
         serviceScope.launch(Dispatchers.Main) {
             _connectionState.value = ConnectionState.DISCONNECTED
             _connectedDeviceName.value = null

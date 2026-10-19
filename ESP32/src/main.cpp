@@ -7,6 +7,23 @@
 #include <string.h>
 
 BluetoothSerial SerialBT;
+bool bluetoothActive = false;
+
+bool enableBluetooth() {
+  if (bluetoothActive) return true;
+  bluetoothActive = SerialBT.begin("Yacksi");
+  if (!bluetoothActive) {
+    Serial.println("Bluetooth initialization failed; serial remains available.");
+  }
+  return bluetoothActive;
+}
+
+void disableBluetooth() {
+  if (!bluetoothActive) return;
+  SerialBT.end();
+  bluetoothActive = false;
+}
+
 /*
 * extend the Arduino Print class to support sending messages via both Serial and Bluetooth
 * MessageOutput is constructed with a boolean indicating whether to send messages via Bluetooth
@@ -41,6 +58,7 @@ MessageOutput sendMessage(bool sendBluetooth) {
 #define RXD2 33
 #define TXD2 32
 #define ENA_PIN 25
+#define CALIBRATION_LED_PIN 4
 
 // --- ADXL355 & RM3100 SPI Pins ---
 #define SPI_SCK  18
@@ -134,6 +152,8 @@ uint8_t laserCycleState = 0;
 unsigned long laserDeadline = 0;
 unsigned long nextLaserCycle = 0;
 uint16_t lastDistanceMm = 0;
+const unsigned long BLUETOOTH_SETTLE_MS = 100;
+const unsigned long SENSOR_SETTLE_MS = 100;
 
 // ============================================================
 // ADXL355 SPI Functions (uses (reg << 1) | RW format)
@@ -246,6 +266,7 @@ void startAccelerometerCalibration() {
     sendMessage(true).println("Finish magnetometer calibration before starting accelerometer calibration.");
     return;
   }
+  enableBluetooth();
   reading = false;
   laserCycleState = 0;
   turnLaserOn();
@@ -375,7 +396,8 @@ void stopReading() {
   reading = false;
   laserCycleState = 0;
   turnLaserOff();
-  sendMessage(true).println("STOPPED");
+  const bool bluetoothAvailable = enableBluetooth();
+  sendMessage(bluetoothAvailable).println("STOPPED");
 }
 
 void handleCommand(char command) {
@@ -569,7 +591,7 @@ bool loadMagCalibration() {
 
 bool saveMagCalibration(const float offset[3], const float matrix[3][3]) {
   if (!calibrationPreferences.begin("calib", false)) {
-    sendMessage(true).println("Could not open magnetometer calibration storage.");
+    sendMessage(false).println("Could not open magnetometer calibration storage.");
     return false;
   }
 
@@ -846,38 +868,53 @@ void startMagnetometerCalibration() {
     sendMessage(true).println("Finish accelerometer calibration before starting magnetometer calibration.");
     return;
   }
+  sendMessage(true).println("Starting magnetometer calibration; Bluetooth will be unavailable until calibration ends.");
+  disableBluetooth();
   reading = false;
   laserCycleState = 0;
-  turnLaserOn();
+  turnLaserOff();
+  digitalWrite(CALIBRATION_LED_PIN, HIGH);
   magSampleCount = 0;
   magCalibrationActive = true;
   magCalibrationStartTime = millis();
   lastMagSampleTime = magCalibrationStartTime - MAG_CAL_SAMPLE_INTERVAL_MS;
-  sendMessage(true).println("--- Magnetometer calibration ---");
-  sendMessage(true).println("Slowly rotate the instrument through all orientations; aim for 300-500 samples.");
-  sendMessage(true).println("Press any key or S to finish and fit the calibration.");
+  sendMessage(false).println("--- Magnetometer calibration ---");
+  sendMessage(false).println("Slowly rotate the instrument through all orientations; aim for 300-500 samples.");
+  sendMessage(false).println("Press any key on the serial connection to finish and fit the calibration.");
+}
+
+bool endMagnetometerCalibration() {
+  digitalWrite(CALIBRATION_LED_PIN, LOW);
+  return enableBluetooth();
 }
 
 void finishMagnetometerCalibration() {
   magCalibrationActive = false;
   turnLaserOff();
-  sendMessage(true).print("Collected magnetometer samples: ");
-  sendMessage(true).println(static_cast<unsigned int>(magSampleCount));
   if (magSampleCount < MAG_CAL_MIN_SAMPLES) {
-    sendMessage(true).print("Calibration failed: at least ");
-    sendMessage(true).print(MAG_CAL_MIN_SAMPLES);
-    sendMessage(true).println(" samples are required; existing calibration was not changed.");
+    const bool bluetoothAvailable = endMagnetometerCalibration();
+    sendMessage(bluetoothAvailable).print("Collected magnetometer samples: ");
+    sendMessage(bluetoothAvailable).println(static_cast<unsigned int>(magSampleCount));
+    sendMessage(bluetoothAvailable).print("Calibration failed: at least ");
+    sendMessage(bluetoothAvailable).print(MAG_CAL_MIN_SAMPLES);
+    sendMessage(bluetoothAvailable).println(" samples are required; existing calibration was not changed.");
     return;
   }
 
   float newOffset[3];
   float newMatrix[3][3] = {};
   if (!fitMagnetometerCalibration(newOffset, newMatrix)) {
-    sendMessage(true).println("Magnetometer ellipsoid fit failed (insufficient orientation coverage or singular fit); existing calibration was not changed.");
+    const bool bluetoothAvailable = endMagnetometerCalibration();
+    sendMessage(bluetoothAvailable).print("Collected magnetometer samples: ");
+    sendMessage(bluetoothAvailable).println(static_cast<unsigned int>(magSampleCount));
+    sendMessage(bluetoothAvailable).println("Magnetometer ellipsoid fit failed (insufficient orientation coverage or singular fit); existing calibration was not changed.");
     return;
   }
   if (!saveMagCalibration(newOffset, newMatrix)) {
-    sendMessage(true).println("Could not save magnetometer calibration; existing calibration was not changed.");
+    const bool bluetoothAvailable = endMagnetometerCalibration();
+    sendMessage(bluetoothAvailable).print("Collected magnetometer samples: ");
+    sendMessage(bluetoothAvailable).println(static_cast<unsigned int>(magSampleCount));
+    sendMessage(bluetoothAvailable).println("Could not save magnetometer calibration; existing calibration was not changed.");
     return;
   }
 
@@ -888,17 +925,20 @@ void finishMagnetometerCalibration() {
     }
   }
   magCalibrationValid = true;
-  sendMessage(true).print("Magnetometer hard-iron offset: ");
-  sendMessage(true).print(magOffset[0], 3); sendMessage(true).print(", ");
-  sendMessage(true).print(magOffset[1], 3); sendMessage(true).print(", ");
-  sendMessage(true).println(magOffset[2], 3);
-  sendMessage(true).println("Magnetometer soft-iron matrix:");
+  const bool bluetoothAvailable = endMagnetometerCalibration();
+  sendMessage(bluetoothAvailable).print("Collected magnetometer samples: ");
+  sendMessage(bluetoothAvailable).println(static_cast<unsigned int>(magSampleCount));
+  sendMessage(bluetoothAvailable).print("Magnetometer hard-iron offset: ");
+  sendMessage(bluetoothAvailable).print(magOffset[0], 3); sendMessage(bluetoothAvailable).print(", ");
+  sendMessage(bluetoothAvailable).print(magOffset[1], 3); sendMessage(bluetoothAvailable).print(", ");
+  sendMessage(bluetoothAvailable).println(magOffset[2], 3);
+  sendMessage(bluetoothAvailable).println("Magnetometer soft-iron matrix:");
   for (int row = 0; row < 3; ++row) {
-    sendMessage(true).print(magMatrix[row][0], 8); sendMessage(true).print(", ");
-    sendMessage(true).print(magMatrix[row][1], 8); sendMessage(true).print(", ");
-    sendMessage(true).println(magMatrix[row][2], 8);
+    sendMessage(bluetoothAvailable).print(magMatrix[row][0], 8); sendMessage(bluetoothAvailable).print(", ");
+    sendMessage(bluetoothAvailable).print(magMatrix[row][1], 8); sendMessage(bluetoothAvailable).print(", ");
+    sendMessage(bluetoothAvailable).println(magMatrix[row][2], 8);
   }
-  sendMessage(true).println("Magnetometer calibration saved.");
+  sendMessage(bluetoothAvailable).println("Magnetometer calibration saved.");
 }
 
 void serviceMagnetometerCalibration() {
@@ -917,7 +957,7 @@ void serviceMagnetometerCalibration() {
   magSamples[magSampleCount][2] = readRM3100Axis(RM3100_MX2_REG + 6);
   ++magSampleCount;
   if (magSampleCount == MAG_CAL_MAX_SAMPLES) {
-    sendMessage(true).println("Sample buffer full; fitting calibration.");
+    sendMessage(false).println("Sample buffer full; fitting calibration.");
     finishMagnetometerCalibration();
   }
 }
@@ -1001,9 +1041,9 @@ float getCompassBearing(float rawX, float rawY, float rawZ) {
 // ============================================================
 void setup() {
   Serial.begin(115200);
-  if (!SerialBT.begin("Yacksi")) {
-    sendMessage(true).println("Bluetooth initialization failed; serial remains available.");
-  }
+  pinMode(CALIBRATION_LED_PIN, OUTPUT);
+  digitalWrite(CALIBRATION_LED_PIN, LOW);
+  enableBluetooth();
   delay(1000);
   
   // --- M01 Laser Setup ---
@@ -1038,9 +1078,8 @@ void serviceStreaming() {
   const unsigned long now = millis();
   if (laserCycleState == 0) {
     if (now < nextLaserCycle) return;
-    while (Serial1.available()) Serial1.read();
-    turnLaserOn();
-    laserDeadline = now + 500;
+    disableBluetooth();
+    laserDeadline = now + BLUETOOTH_SETTLE_MS;
     laserCycleState = 1;
     return;
   }
@@ -1048,11 +1087,22 @@ void serviceStreaming() {
   if (laserCycleState == 1) {
     if (now < laserDeadline) return;
     while (Serial1.available()) Serial1.read();
-    Serial1.write(measureCmd, sizeof(measureCmd));
-    laserDeadline = now + 2500;
+    turnLaserOn();
+    laserDeadline = now + 500;
     laserCycleState = 2;
     return;
   }
+
+  if (laserCycleState == 2) {
+    if (now < laserDeadline) return;
+    while (Serial1.available()) Serial1.read();
+    Serial1.write(measureCmd, sizeof(measureCmd));
+    laserDeadline = now + 2500;
+    laserCycleState = 3;
+    return;
+  }
+
+  if (laserCycleState != 3) return;
   if (now < laserDeadline) return;
 
   if (Serial1.available() >= 13) {
@@ -1062,6 +1112,15 @@ void serviceStreaming() {
       lastDistanceMm = static_cast<uint16_t>(bcd32(&response[6]));
     }
   }
+
+  turnLaserOff();
+  laserDeadline = millis() + SENSOR_SETTLE_MS;
+  laserCycleState = 4;
+  return;
+}
+
+void serviceStreamingOrientation() {
+  if (!reading || laserCycleState != 4 || millis() < laserDeadline) return;
   
   int32_t acceleration[3];
   readAccelerometer(acceleration);
@@ -1075,17 +1134,17 @@ void serviceStreaming() {
     static_cast<float>(mx), static_cast<float>(my), static_cast<float>(mz));
   const float inclination = calculateInclinationX(ax, ay, az);
 
-  sendMessage(true).print("DIST_MM="); sendMessage(true).print(lastDistanceMm);
-  sendMessage(true).print(",AX="); sendMessage(true).print(ax);
-  sendMessage(true).print(",AY="); sendMessage(true).print(ay);
-  sendMessage(true).print(",AZ="); sendMessage(true).print(az);
-  sendMessage(true).print(",MX="); sendMessage(true).print(mx);
-  sendMessage(true).print(",MY="); sendMessage(true).print(my);
-  sendMessage(true).print(",MZ="); sendMessage(true).print(mz);
-  sendMessage(true).print(",BEARING="); sendMessage(true).print(bearing, 1);
-  sendMessage(true).print(",INCL="); sendMessage(true).println(inclination, 1);
+  const bool bluetoothAvailable = enableBluetooth();
+  sendMessage(bluetoothAvailable).print("DIST_MM="); sendMessage(bluetoothAvailable).print(lastDistanceMm);
+  sendMessage(bluetoothAvailable).print(",AX="); sendMessage(bluetoothAvailable).print(ax);
+  sendMessage(bluetoothAvailable).print(",AY="); sendMessage(bluetoothAvailable).print(ay);
+  sendMessage(bluetoothAvailable).print(",AZ="); sendMessage(bluetoothAvailable).print(az);
+  sendMessage(bluetoothAvailable).print(",MX="); sendMessage(bluetoothAvailable).print(mx);
+  sendMessage(bluetoothAvailable).print(",MY="); sendMessage(bluetoothAvailable).print(my);
+  sendMessage(bluetoothAvailable).print(",MZ="); sendMessage(bluetoothAvailable).print(mz);
+  sendMessage(bluetoothAvailable).print(",BEARING="); sendMessage(bluetoothAvailable).print(bearing, 1);
+  sendMessage(bluetoothAvailable).print(",INCL="); sendMessage(bluetoothAvailable).println(inclination, 1);
 
-  turnLaserOff();
   laserCycleState = 0;
   nextLaserCycle = millis() + 1000;
 }
@@ -1095,4 +1154,5 @@ void loop() {
   serviceAccelerometerCalibration();
   serviceMagnetometerCalibration();
   serviceStreaming();
+  serviceStreamingOrientation();
 }

@@ -19,8 +19,11 @@ class MainActivity : ComponentActivity() {
 
     private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { _ ->
-        // Permissions result handled
+    ) { permissions ->
+        val allGranted = permissions.values.all { it }
+        if (allGranted) {
+            viewModel.autoConnectDefaultDevice()
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -49,6 +52,8 @@ class MainActivity : ComponentActivity() {
         }
         if (missingPermissions.isNotEmpty()) {
             requestPermissionLauncher.launch(missingPermissions.toTypedArray())
+        } else {
+            viewModel.autoConnectDefaultDevice()
         }
     }
 
