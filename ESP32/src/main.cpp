@@ -7,22 +7,22 @@
 #include <string.h>
 
 BluetoothSerial SerialBT;
-bool bluetoothActive = false;
+// bool bluetoothActive = false;
 
-bool enableBluetooth() {
-  if (bluetoothActive) return true;
-  bluetoothActive = SerialBT.begin("Yacksi");
-  if (!bluetoothActive) {
-    Serial.println("Bluetooth initialization failed; serial remains available.");
-  }
-  return bluetoothActive;
-}
+// bool enableBluetooth() {
+//   if (bluetoothActive) return true;
+//   bluetoothActive = SerialBT.begin("Yacksi");
+//   if (!bluetoothActive) {
+//     Serial.println("Bluetooth initialization failed; serial remains available.");
+//   }
+//   return bluetoothActive;
+// }
 
-void disableBluetooth() {
-  if (!bluetoothActive) return;
-  SerialBT.end();
-  bluetoothActive = false;
-}
+// void disableBluetooth() {
+//   if (!bluetoothActive) return;
+//   SerialBT.end();
+//   bluetoothActive = false;
+// }
 
 /*
 * extend the Arduino Print class to support sending messages via both Serial and Bluetooth
@@ -152,7 +152,7 @@ uint8_t laserCycleState = 0;
 unsigned long laserDeadline = 0;
 unsigned long nextLaserCycle = 0;
 uint16_t lastDistanceMm = 0;
-const unsigned long BLUETOOTH_SETTLE_MS = 100;
+const unsigned long LASER_SETTLE_MS = 100;
 const unsigned long SENSOR_SETTLE_MS = 100;
 
 // ============================================================
@@ -266,7 +266,7 @@ void startAccelerometerCalibration() {
     sendMessage(true).println("Finish magnetometer calibration before starting accelerometer calibration.");
     return;
   }
-  enableBluetooth();
+
   reading = false;
   laserCycleState = 0;
   turnLaserOn();
@@ -383,31 +383,23 @@ void eraseMagCalibration();
 
 void startReading() {
   if (magCalibrationActive || accelCalibrationActive) {
-    sendMessage(true).println("Finish calibration before starting streaming.");
+    sendMessage(true).println("Finish calibration before taking a reading.");
+    return;
+  }
+  if (reading) {
+    sendMessage(true).println("A reading is already in progress.");
     return;
   }
   reading = true;
   laserCycleState = 0;
   nextLaserCycle = millis();
-  sendMessage(true).println("READING: DIST_MM,AX,AY,AZ,MX,MY,MZ,BEARING,INCL");
-}
-
-void stopReading() {
-  reading = false;
-  laserCycleState = 0;
-  turnLaserOff();
-  const bool bluetoothAvailable = enableBluetooth();
-  sendMessage(bluetoothAvailable).println("STOPPED");
+  //sendMessage(true).println("READING: DIST_MM,AX,AY,AZ,MX,MY,MZ,BEARING,INCL");
 }
 
 void handleCommand(char command) {
   switch (toupper(static_cast<unsigned char>(command))) {
     case 'R':
       startReading();
-      break;
-    case 'S':
-      if (magCalibrationActive) finishMagnetometerCalibration();
-      stopReading();
       break;
     case 'M':
       startMagnetometerCalibration();
@@ -420,10 +412,10 @@ void handleCommand(char command) {
       break;
     case 'H':
     case '?':
-      sendMessage(true).println("Commands: R=read, S=stop, M=mag calibration, A=accelerometer calibration, X=erase mag calibration, H=help");
+      sendMessage(true).println("Commands: R=read, M=mag calibration, A=accelerometer calibration, X=erase mag calibration, H=help");
       break;
     default:
-      sendMessage(true).println("Unknown command. Use R, S, M, A, X, or H.");
+      sendMessage(true).println("Unknown command. Use R, M, A, X, or H.");
       break;
   }
 }
@@ -437,15 +429,15 @@ void processInputCharacter(char input) {
     }
     finishMagnetometerCalibration();
     const char command = static_cast<char>(toupper(static_cast<unsigned char>(input)));
-    if (command == 'S' || command == 'R' || command == 'X' ||
-        command == 'A' || command == 'H' || command == '?') {
+    if (command == 'R' || command == 'X' || command == 'A' ||
+        command == 'H' || command == '?') {
       handleCommand(command);
     }
     return;
   }
 
   if (accelCalibrationActive) {
-    if (input == 'q' || input == 'Q' || input == 's' || input == 'S') {
+    if (input == 'q' || input == 'Q') {
       accelCalibrationActive = false;
       accelPositionSampling = false;
       turnLaserOff();
@@ -492,6 +484,10 @@ uint8_t rm3100_readRegister(uint8_t reg) {
   uint8_t value = SPI.transfer(0x00);
   digitalWrite(RM3100_CS, HIGH);
   return value;
+}
+
+bool rm3100_dataReady() {
+  return (rm3100_readRegister(RM3100_STATUS_REG) & 0x80) != 0;
 }
 
 void initRM3100() {
@@ -587,6 +583,38 @@ bool loadMagCalibration() {
 
   sendMessage(true).println("WARNING: No valid magnetometer calibration; using zero offset and identity matrix.");
   return false;
+}
+
+void printCalibrationToSerial() {
+  Serial.println("--- Active accelerometer calibration ---");
+  Serial.println("Offset:");
+  for (int axis = 0; axis < 3; ++axis) {
+    Serial.print(accelerometerCalibration.offset[axis], 6);
+    Serial.println();
+  }
+  Serial.println("Scale matrix:");
+  for (int row = 0; row < 3; ++row) {
+    for (int column = 0; column < 3; ++column) {
+      if (column > 0) Serial.print(", ");
+      Serial.print(row == column ? accelerometerCalibration.scale[row] : 0.0f, 6);
+    }
+    Serial.println();
+  }
+
+  Serial.println("--- Active magnetometer calibration ---");
+  Serial.println("Offset:");
+  for (int axis = 0; axis < 3; ++axis) {
+    Serial.print(magOffset[axis], 6);
+    Serial.println();
+  }
+  Serial.println("Soft-iron matrix:");
+  for (int row = 0; row < 3; ++row) {
+    for (int column = 0; column < 3; ++column) {
+      if (column > 0) Serial.print(", ");
+      Serial.print(magMatrix[row][column], 8);
+    }
+    Serial.println();
+  }
 }
 
 bool saveMagCalibration(const float offset[3], const float matrix[3][3]) {
@@ -869,7 +897,7 @@ void startMagnetometerCalibration() {
     return;
   }
   sendMessage(true).println("Starting magnetometer calibration; Bluetooth will be unavailable until calibration ends.");
-  disableBluetooth();
+  //disableBluetooth();
   reading = false;
   laserCycleState = 0;
   turnLaserOff();
@@ -885,7 +913,8 @@ void startMagnetometerCalibration() {
 
 bool endMagnetometerCalibration() {
   digitalWrite(CALIBRATION_LED_PIN, LOW);
-  return enableBluetooth();
+  //return enableBluetooth();
+  return true;
 }
 
 void finishMagnetometerCalibration() {
@@ -942,15 +971,17 @@ void finishMagnetometerCalibration() {
 }
 
 void serviceMagnetometerCalibration() {
+  const unsigned long now = millis();
   if (!magCalibrationActive ||
-      millis() - lastMagSampleTime < MAG_CAL_SAMPLE_INTERVAL_MS) {
+      now - lastMagSampleTime < MAG_CAL_SAMPLE_INTERVAL_MS) {
     return;
   }
-  lastMagSampleTime = millis();
   if (magSampleCount >= MAG_CAL_MAX_SAMPLES) {
     finishMagnetometerCalibration();
     return;
   }
+  if (!rm3100_dataReady()) return;
+  lastMagSampleTime = now;
 
   magSamples[magSampleCount][0] = readRM3100Axis(RM3100_MX2_REG);
   magSamples[magSampleCount][1] = readRM3100Axis(RM3100_MX2_REG + 3);
@@ -1043,7 +1074,7 @@ void setup() {
   Serial.begin(115200);
   pinMode(CALIBRATION_LED_PIN, OUTPUT);
   digitalWrite(CALIBRATION_LED_PIN, LOW);
-  enableBluetooth();
+  SerialBT.begin("Yacksi");
   delay(1000);
   
   // --- M01 Laser Setup ---
@@ -1068,18 +1099,18 @@ void setup() {
   initRM3100();
   loadAccelerometerCalibration();
   loadMagCalibration();
+  printCalibrationToSerial();
   
   sendMessage(true).println("--- System Ready ---");
-  sendMessage(true).println("Commands: R=stream, S=stop, M=mag calibration, A=accelerometer calibration, X=erase mag calibration, H=help.");
+  sendMessage(true).println("Commands: R=Read, M=mag calibration, A=accelerometer calibration, X=erase mag calibration, H=help.");
 }
 
-void serviceStreaming() {
+void takeDistanceReading() {
   if (!reading) return;
   const unsigned long now = millis();
   if (laserCycleState == 0) {
     if (now < nextLaserCycle) return;
-    disableBluetooth();
-    laserDeadline = now + BLUETOOTH_SETTLE_MS;
+    laserDeadline = now + LASER_SETTLE_MS;
     laserCycleState = 1;
     return;
   }
@@ -1119,8 +1150,9 @@ void serviceStreaming() {
   return;
 }
 
-void serviceStreamingOrientation() {
+void takeRotationReading() {
   if (!reading || laserCycleState != 4 || millis() < laserDeadline) return;
+  if (!rm3100_dataReady()) return;
   
   int32_t acceleration[3];
   readAccelerometer(acceleration);
@@ -1130,29 +1162,76 @@ void serviceStreamingOrientation() {
   const int32_t mx = readRM3100Axis(RM3100_MX2_REG);
   const int32_t my = readRM3100Axis(RM3100_MX2_REG + 3);
   const int32_t mz = readRM3100Axis(RM3100_MX2_REG + 6);
+  
+  
+  //copilot
+  float raw[3] =
+{
+    mx - magOffset[0],
+    my - magOffset[1],
+    mz - magOffset[2]
+};
+
+float sx =
+      magMatrix[0][0]*raw[0]
+    + magMatrix[0][1]*raw[1]
+    + magMatrix[0][2]*raw[2];
+
+float sy =
+      magMatrix[1][0]*raw[0]
+    + magMatrix[1][1]*raw[1]
+    + magMatrix[1][2]*raw[2];
+sy = -sy;
+
+float sz =
+      magMatrix[2][0]*raw[0]
+    + magMatrix[2][1]*raw[1]
+    + magMatrix[2][2]*raw[2];
+
+
+float radius = sqrtf(
+    sx*sx +
+    sy*sy +
+    sz*sz
+);
+
+sendMessage(true).print("sx=");
+sendMessage(true).print(sx);
+sendMessage(true).print(",sy=");
+sendMessage(true).println(sy);
+sendMessage(true).print(",sz=");
+sendMessage(true).println(sz);
+sendMessage(true).print(",radius=");
+sendMessage(true).println(radius);
+
+float simplebearing =
+    atan2f(sy,sx)*180.0f/PI;
+
+if(simplebearing < 0)
+    simplebearing += 360.0f;
   const float bearing = getCompassBearing(
     static_cast<float>(mx), static_cast<float>(my), static_cast<float>(mz));
+
+
   const float inclination = calculateInclinationX(ax, ay, az);
-
-  const bool bluetoothAvailable = enableBluetooth();
-  sendMessage(bluetoothAvailable).print("DIST_MM="); sendMessage(bluetoothAvailable).print(lastDistanceMm);
-  sendMessage(bluetoothAvailable).print(",AX="); sendMessage(bluetoothAvailable).print(ax);
-  sendMessage(bluetoothAvailable).print(",AY="); sendMessage(bluetoothAvailable).print(ay);
-  sendMessage(bluetoothAvailable).print(",AZ="); sendMessage(bluetoothAvailable).print(az);
-  sendMessage(bluetoothAvailable).print(",MX="); sendMessage(bluetoothAvailable).print(mx);
-  sendMessage(bluetoothAvailable).print(",MY="); sendMessage(bluetoothAvailable).print(my);
-  sendMessage(bluetoothAvailable).print(",MZ="); sendMessage(bluetoothAvailable).print(mz);
-  sendMessage(bluetoothAvailable).print(",BEARING="); sendMessage(bluetoothAvailable).print(bearing, 1);
-  sendMessage(bluetoothAvailable).print(",INCL="); sendMessage(bluetoothAvailable).println(inclination, 1);
-
+  sendMessage(true).print("DIST_MM="); sendMessage(true).print(lastDistanceMm);
+  sendMessage(true).print(",AX="); sendMessage(true).print(ax);
+  sendMessage(true).print(",AY="); sendMessage(true).print(ay);
+  sendMessage(true).print(",AZ="); sendMessage(true).print(az);
+  sendMessage(true).print(",MX="); sendMessage(true).print(mx);
+  sendMessage(true).print(",MY="); sendMessage(true).print(my);
+  sendMessage(true).print(",MZ="); sendMessage(true).print(mz);
+  sendMessage(true).print(",BEARING="); sendMessage(true).print(bearing, 1);
+  sendMessage(true).print(",Simple BEARING="); sendMessage(true).print(simplebearing, 1);
+  sendMessage(true).print(",INCL="); sendMessage(true).println(inclination, 1);
+  reading = false;
   laserCycleState = 0;
-  nextLaserCycle = millis() + 1000;
 }
 
 void loop() {
   pollCommands();
   serviceAccelerometerCalibration();
   serviceMagnetometerCalibration();
-  serviceStreaming();
-  serviceStreamingOrientation();
+  takeDistanceReading();
+  takeRotationReading();
 }
