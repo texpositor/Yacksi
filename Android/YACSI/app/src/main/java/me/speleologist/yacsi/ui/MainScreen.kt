@@ -32,6 +32,7 @@ fun MainScreen(
     var showDeviceDialog by remember { mutableStateOf(false) }
     var showMenu by remember { mutableStateOf(false) }
     var showEraseConfirmDialog by remember { mutableStateOf(false) }
+    var showEraseShotConfirmDialog by remember { mutableStateOf(false) }
 
     val listState = rememberLazyListState()
     val clipboardManager = LocalClipboardManager.current
@@ -52,6 +53,42 @@ fun MainScreen(
             confirmButton = {
                 TextButton(onClick = { viewModel.clearWarning() }) {
                     Text("OK")
+                }
+            }
+        )
+    }
+
+    uiState.infoMessage?.let { msg ->
+        AlertDialog(
+            onDismissRequest = { viewModel.clearInfo() },
+            title = { Text("Calibration") },
+            text = { Text(msg) },
+            confirmButton = {
+                TextButton(onClick = { viewModel.clearInfo() }) {
+                    Text("OK")
+                }
+            }
+        )
+    }
+
+    if (showEraseShotConfirmDialog) {
+        AlertDialog(
+            onDismissRequest = { showEraseShotConfirmDialog = false },
+            title = { Text("Erase Shot Calibration") },
+            text = { Text("Stop using the shot calibration and fall back to the rough accelerometer/magnetometer calibration? The stored shots are kept, so Refit Stored Shots can restore it.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showEraseShotConfirmDialog = false
+                        viewModel.eraseShotCalibration()
+                    }
+                ) {
+                    Text("Erase", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showEraseShotConfirmDialog = false }) {
+                    Text("Cancel")
                 }
             }
         )
@@ -171,14 +208,43 @@ fun MainScreen(
                             onDismissRequest = { showMenu = false }
                         ) {
                             DropdownMenuItem(
-                                text = { Text("Calibrate Accelerometer") },
+                                text = { Text("Shot Calibration") },
+                                onClick = {
+                                    showMenu = false
+                                    viewModel.startShotCalibration()
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Refit Stored Shots") },
+                                onClick = {
+                                    showMenu = false
+                                    viewModel.refitStoredShots()
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Show Calibration Data") },
+                                onClick = {
+                                    showMenu = false
+                                    viewModel.dumpShotCalibration()
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Erase Shot Calibration") },
+                                onClick = {
+                                    showMenu = false
+                                    showEraseShotConfirmDialog = true
+                                }
+                            )
+                            HorizontalDivider()
+                            DropdownMenuItem(
+                                text = { Text("Rough Accelerometer Calibration") },
                                 onClick = {
                                     showMenu = false
                                     viewModel.startAccelCalibration()
                                 }
                             )
                             DropdownMenuItem(
-                                text = { Text("Calibrate Magnetometer") },
+                                text = { Text("Rough Magnetometer Calibration") },
                                 onClick = {
                                     showMenu = false
                                     viewModel.startMagCalibration()
@@ -205,7 +271,17 @@ fun MainScreen(
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             // Mode Banner / Calibration Controls if in calibration mode
-            if (uiState.appMode != AppMode.NORMAL) {
+            if (uiState.appMode == AppMode.SHOT_CALIBRATION) {
+                ShotCalibrationCard(
+                    state = uiState.shotCalibration,
+                    onTakeShot = { viewModel.takeCalibrationShot() },
+                    onUndo = { viewModel.undoCalibrationShot() },
+                    onFinishEarly = { viewModel.finishShotCalibrationEarly() },
+                    onAbort = { viewModel.abortShotCalibration() },
+                    onAccept = { viewModel.acceptShotCalibration() },
+                    onDiscard = { viewModel.discardShotCalibration() }
+                )
+            } else if (uiState.appMode != AppMode.NORMAL) {
                 Card(
                     colors = CardDefaults.cardColors(
                         containerColor = MaterialTheme.colorScheme.tertiaryContainer
@@ -214,19 +290,19 @@ fun MainScreen(
                 ) {
                     Column(modifier = Modifier.padding(16.dp)) {
                         Text(
-                            text = if (uiState.appMode == AppMode.ACCEL_CALIBRATION)
-                                "Mode: Accelerometer Calibration"
-                            else
-                                "Mode: Magnetometer Calibration",
+                            text = when (uiState.appMode) {
+                                AppMode.ACCEL_CALIBRATION -> "Mode: Rough Accelerometer Calibration"
+                                else -> "Mode: Rough Magnetometer Calibration"
+                            },
                             fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.onTertiaryContainer
                         )
                         Spacer(modifier = Modifier.height(8.dp))
                         Text(
-                            text = if (uiState.appMode == AppMode.ACCEL_CALIBRATION)
-                                "Place device in requested orientation and press Continue."
-                            else
-                                "Rotate instrument through all orientations continuously until complete.",
+                            text = when (uiState.appMode) {
+                                AppMode.ACCEL_CALIBRATION -> "Place device in requested orientation and press Continue."
+                                else -> "Rotate instrument through all orientations continuously until complete."
+                            },
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onTertiaryContainer
                         )
@@ -276,6 +352,27 @@ fun MainScreen(
                             label = "Inclination",
                             value = if (reading != null) "%.1f°".format(reading.incl) else "---",
                             modifier = Modifier.weight(1f)
+                        )
+                    }
+
+                    if (reading?.calibration != null) {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        // Under the shot calibration the field magnitude is 1.0; a large
+                        // deviation suggests nearby iron or electrical interference.
+                        val interference = reading.calibration == "SHOT" &&
+                            reading.mLen != null && kotlin.math.abs(reading.mLen - 1f) > 0.05f
+                        Text(
+                            text = buildString {
+                                append(if (reading.calibration == "SHOT") "Shot calibration" else "Rough calibration only")
+                                reading.mLen?.let { append("  ·  field %.3f".format(it)) }
+                                if (interference) append("  ·  possible magnetic interference")
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (interference || reading.calibration != "SHOT") {
+                                MaterialTheme.colorScheme.error
+                            } else {
+                                MaterialTheme.colorScheme.outline
+                            }
                         )
                     }
 
