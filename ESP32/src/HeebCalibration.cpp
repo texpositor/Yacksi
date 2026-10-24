@@ -509,26 +509,30 @@ const char* qualityLabel(float rms) {
   return "POOR";
 }
 
+// Targets 1-12 are level, 45 deg up and 45 deg down, each towards N, E, S, W;
+// 13 and 14 are steeply up and down. The compass points only need to be
+// roughly 90 deg apart, but naming them makes it easy to keep track.
 void describeShot(int group, int roll, char* text, size_t size) {
   static const char* rolls[HEEB_ROLLS] = {
     "top face up",
-    "rolled 90 deg clockwise about the laser",
+    "rolled 90 deg clockwise",
     "upside down",
-    "rolled 270 deg clockwise about the laser"
+    "rolled 270 deg clockwise"
   };
-  char aim[64];
+  static const char* headings[4] = {"N", "E", "S", "W"};
+  const char* heading;
+  const char* elevation;
   if (group < 12) {
-    static const char* elevations[3] = {"level", "about 45 deg up", "about 45 deg down"};
-    snprintf(aim, sizeof(aim), "%s, heading %d of 4 (about 90 deg apart)",
-             elevations[group / 4], group % 4 + 1);
+    static const char* elevations[3] = {"level", "45 deg up", "45 deg down"};
+    heading = headings[group % 4];
+    elevation = elevations[group / 4];
   } else {
-    snprintf(aim, sizeof(aim), "steeply %s (about 70 deg)", group == 12 ? "up" : "down");
+    heading = group == 12 ? "N" : "S";
+    elevation = group == 12 ? "steeply up (70 deg)" : "steeply down (70 deg)";
   }
-  if (roll == 0) {
-    snprintf(text, size, "New target: aim %s; %s", aim, rolls[roll]);
-  } else {
-    snprintf(text, size, "Same target as last shot; %s", rolls[roll]);
-  }
+  snprintf(text, size, "%s %s, %s - %s",
+           roll == 0 ? "New target roughly" : "Continue pointing",
+           heading, elevation, rolls[roll]);
 }
 
 void sendPrompt() {
