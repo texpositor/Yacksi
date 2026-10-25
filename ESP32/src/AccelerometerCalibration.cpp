@@ -32,6 +32,7 @@ bool processAccelerometerCalibrationInput(char input) {
       accelPositionSampleCount = 0;
       accelPositionSums[0] = accelPositionSums[1] = accelPositionSums[2] = 0;
       lastAccelSampleTime = millis() - ACCEL_CAL_SAMPLE_INTERVAL_MS;
+      playSound(Sound::Beep);
       sendMessage(true).println("Sampling position...");
     }
   }
@@ -118,6 +119,7 @@ void finishAccelerometerCalibration() {
     halfRange[axis] = (accelMaximum[axis] - accelMinimum[axis]) / 2.0f;
     if (halfRange[axis] <= 0.0f) {
       sendMessage(true).println("Accelerometer calibration failed: an axis had no measurable range.");
+      playSound(Sound::Error);
       accelCalibrationActive = false;
       turnLaserOff();
       return;
@@ -132,6 +134,7 @@ void finishAccelerometerCalibration() {
 
   if (!saveAccelerometerCalibration(newCalibration)) {
     sendMessage(true).println("Could not save accelerometer calibration.");
+    playSound(Sound::Error);
     accelCalibrationActive = false;
     turnLaserOff();
     return;
@@ -140,6 +143,7 @@ void finishAccelerometerCalibration() {
   accelerometerCalibration = newCalibration;
   accelCalibrationActive = false;
   turnLaserOff();
+  playSound(Sound::Success);
   sendMessage(true).println("Accelerometer calibration complete and saved.");
   for (int axis = 0; axis < 3; ++axis) {
     sendMessage(true).print("Axis ");
@@ -179,6 +183,7 @@ void serviceAccelerometerCalibration() {
     finishAccelerometerCalibration();
     return;
   }
+  playSound(Sound::Success);
 
   const char* positions[] = {
     "X axis pointing up", "X axis pointing down",

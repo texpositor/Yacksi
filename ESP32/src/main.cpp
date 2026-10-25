@@ -46,6 +46,24 @@ uint16_t lastDistanceMm = 0;
 const unsigned long LASER_SETTLE_MS = 100;
 const unsigned long SENSOR_SETTLE_MS = 100;
 
+// Fixed correction added to every laser distance, e.g. to correct the module
+// against a steel tape or to move the datum to the rear of the enclosure.
+int32_t distanceOffsetMm = 0;
+const int32_t MAX_DISTANCE_OFFSET_MM = 2000;
+bool distanceOffsetEntryActive = false;
+char distanceOffsetEntry[8];
+uint8_t distanceOffsetEntryLength = 0;
+
+// Push button: the first press turns the laser on for aiming and the second
+// takes the reading. The laser turns off again if no reading is taken in time.
+const unsigned long BUTTON_DEBOUNCE_MS = 30;
+const unsigned long AIM_TIMEOUT_MS = 60000;
+bool buttonAiming = false;
+unsigned long aimStartTime = 0;
+int buttonStableLevel = HIGH;
+int buttonLastLevel = HIGH;
+unsigned long buttonLevelChangeTime = 0;
+
 // ============================================================
 // ADXL355 SPI Functions (uses (reg << 1) | RW format)
 // ============================================================
@@ -125,9 +143,15 @@ void readMagnetometer(int32_t readings[3]) {
   readings[2] = readRM3100Axis(RM3100_MX2_REG + 6);
 }
 
+void processInputCharacter(char input);
+
+bool isAnyCalibrationActive() {
+  return isMagnetometerCalibrationActive() || isAccelerometerCalibrationActive() ||
+         isHeebCalibrationActive();
+}
+
 void startReading() {
-  if (isMagnetometerCalibrationActive() || isAccelerometerCalibrationActive() ||
-      isHeebCalibrationActive()) {
+  if (isAnyCalibrationActive()) {
     sendMessage(true).println("Finish calibration before taking a reading.");
     return;
   }
@@ -136,13 +160,128 @@ void startReading() {
     return;
   }
   reading = true;
-  laserCycleState = 0;
-  nextLaserCycle = millis();
+  buttonAiming = false;
+  if (laserState == 1) {
+    // Already on for aiming, so measure straight away.
+    laserCycleState = 2;
+    laserDeadline = millis();
+  } else {
+    laserCycleState = 0;
+    nextLaserCycle = millis();
+  }
+}
+
+void handleButtonPress() {
+  // During calibration the button stands in for the key that records a point.
+  if (isHeebCalibrationActive()) {
+    processHeebCalibrationInput('T');
+    return;
+  }
+  if (isAccelerometerCalibrationActive() || isMagnetometerCalibrationActive()) {
+    processInputCharacter('\r');
+    return;
+  }
+  if (reading) return;
+  if (!buttonAiming || laserState == 0) {
+    turnLaserOn();
+    buttonAiming = true;
+    aimStartTime = millis();
+    return;
+  }
+  playSound(Sound::Beep);
+  startReading();
+}
+
+void pollButton() {
+  const int level = digitalRead(BUTTON_PIN);
+  const unsigned long now = millis();
+  if (level != buttonLastLevel) {
+    buttonLastLevel = level;
+    buttonLevelChangeTime = now;
+  }
+  if (level != buttonStableLevel && now - buttonLevelChangeTime >= BUTTON_DEBOUNCE_MS) {
+    buttonStableLevel = level;
+    if (level == LOW) handleButtonPress();
+  }
+  if (buttonAiming && now - aimStartTime >= AIM_TIMEOUT_MS) {
+    buttonAiming = false;
+    if (!reading && !isAnyCalibrationActive()) turnLaserOff();
+  }
+}
+
+void loadDistanceOffset() {
+  distanceOffsetMm = 0;
+  if (!calibrationPreferences.begin("laser", true)) return;
+  distanceOffsetMm = calibrationPreferences.getInt("offset_mm", 0);
+  calibrationPreferences.end();
+}
+
+bool saveDistanceOffset(int32_t offsetMm) {
+  if (!calibrationPreferences.begin("laser", false)) return false;
+  const bool saved = calibrationPreferences.putInt("offset_mm", offsetMm) > 0;
+  calibrationPreferences.end();
+  return saved;
+}
+
+// Machine-readable status line for the Android app; STATUS is CURRENT, SAVED,
+// INVALID or FAILED and DIST_OFFSET_MM is always the offset now in use.
+void reportDistanceOffset(const char* status) {
+  sendMessage(true).printf("DIST_OFFSET_MM=%ld,STATUS=%s\n",
+                           static_cast<long>(distanceOffsetMm), status);
+}
+
+// "O" reports the offset; "O<mm>" (e.g. O125 or O-12) sets and saves it.
+// Both are terminated by CR or LF.
+void finishDistanceOffsetEntry() {
+  distanceOffsetEntryActive = false;
+  distanceOffsetEntry[distanceOffsetEntryLength] = '\0';
+  if (distanceOffsetEntryLength == 0) {
+    reportDistanceOffset("CURRENT");
+    return;
+  }
+
+  char* end = nullptr;
+  const long value = strtol(distanceOffsetEntry, &end, 10);
+  if (end == distanceOffsetEntry || *end != '\0' ||
+      value < -MAX_DISTANCE_OFFSET_MM || value > MAX_DISTANCE_OFFSET_MM) {
+    sendMessage(true).printf("Invalid distance offset; use O<mm> between %ld and %ld.\n",
+                             static_cast<long>(-MAX_DISTANCE_OFFSET_MM),
+                             static_cast<long>(MAX_DISTANCE_OFFSET_MM));
+    reportDistanceOffset("INVALID");
+    return;
+  }
+  if (!saveDistanceOffset(value)) {
+    sendMessage(true).println("Could not save distance offset; offset unchanged.");
+    reportDistanceOffset("FAILED");
+    return;
+  }
+  distanceOffsetMm = value;
+  reportDistanceOffset("SAVED");
+}
+
+bool processDistanceOffsetInput(char input) {
+  if (!distanceOffsetEntryActive) return false;
+  if (input == '\r' || input == '\n') {
+    finishDistanceOffsetEntry();
+  } else if (input != ' ' && input != '\t' &&
+             distanceOffsetEntryLength < sizeof(distanceOffsetEntry) - 1) {
+    distanceOffsetEntry[distanceOffsetEntryLength++] = input;
+  } else if (input != ' ' && input != '\t') {
+    // Too long to be a valid offset; keep the entry so it is rejected at the end.
+    distanceOffsetEntry[sizeof(distanceOffsetEntry) - 2] = 'x';
+  }
+  return true;
+}
+
+void startDistanceOffsetEntry() {
+  distanceOffsetEntryActive = true;
+  distanceOffsetEntryLength = 0;
 }
 
 void handleCommand(char command) {
   switch (toupper(static_cast<unsigned char>(command))) {
     case 'R': startReading(); break;
+    case 'O': startDistanceOffsetEntry(); break;
     case 'M': startMagnetometerCalibration(); break;
     case 'C': startHeebCalibration(); break;
     case 'F': refitStoredHeebShots(); break;
@@ -152,16 +291,17 @@ void handleCommand(char command) {
     case 'X': eraseMagCalibration(); break;
     case 'H':
     case '?':
-      sendMessage(true).println("Commands: R=read, C=shot calibration, F=refit stored shots, D=dump shot calibration, E=erase shot calibration, A=rough accel calibration, M=rough mag calibration, X=erase mag calibration, H=help");
+      sendMessage(true).println("Commands: R=read, O=show distance offset, O<mm>=set distance offset, C=shot calibration, F=refit stored shots, D=dump shot calibration, E=erase shot calibration, A=rough accel calibration, M=rough mag calibration, X=erase mag calibration, H=help");
       break;
     default:
-      sendMessage(true).println("Unknown command. Use R, C, F, D, E, A, M, X, or H.");
+      sendMessage(true).println("Unknown command. Use R, O, C, F, D, E, A, M, X, or H.");
       break;
   }
 }
 
 void processInputCharacter(char input) {
-  if (processMagnetometerCalibrationInput(input) ||
+  if (processDistanceOffsetInput(input) ||
+      processMagnetometerCalibrationInput(input) ||
       processAccelerometerCalibrationInput(input) ||
       processHeebCalibrationInput(input)) {
     return;
@@ -256,8 +396,8 @@ void printCalibrationToSerial() {
 // ============================================================
 void setup() {
   Serial.begin(115200);
-  pinMode(CALIBRATION_LED_PIN, OUTPUT);
-  digitalWrite(CALIBRATION_LED_PIN, LOW);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  initBuzzer();
   SerialBT.begin("Yacksi");
   delay(1000);
 
@@ -282,9 +422,12 @@ void setup() {
   loadAccelerometerCalibration();
   loadMagCalibration();
   loadHeebCalibration();
+  loadDistanceOffset();
   printCalibrationToSerial();
+  reportDistanceOffset("CURRENT");
 
   sendMessage(true).println("--- System Ready ---");
+  playSound(Sound::Beep);
   handleCommand('H');
 }
 
@@ -310,6 +453,8 @@ void takeDistanceReading() {
   if (laserCycleState == 2) {
     if (now < laserDeadline) return;
     while (Serial1.available()) Serial1.read();
+    // Stays 0 (reported as a failed shot) unless a valid response arrives.
+    lastDistanceMm = 0;
     Serial1.write(measureCmd, sizeof(measureCmd));
     laserDeadline = now + 2500;
     laserCycleState = 3;
@@ -355,13 +500,19 @@ void takeRotationReading() {
   float g[3], m[3];
   calibratedVectors(rawAccel, rawMag, g, m);
   float bearing, inclination;
-  laserBearingInclination(g, m, bearing, inclination);
+  const bool orientationValid = laserBearingInclination(g, m, bearing, inclination);
   // Field and gravity magnitudes are 1.0 under the shot calibration; a large
   // deviation in MLEN suggests local magnetic interference.
   const float gLength = sqrtf(g[0]*g[0] + g[1]*g[1] + g[2]*g[2]);
   const float mLength = sqrtf(m[0]*m[0] + m[1]*m[1] + m[2]*m[2]);
 
-  sendMessage(true).print("DIST_MM="); sendMessage(true).print(lastDistanceMm);
+  // A zero reading means the laser returned no measurement, so it is left
+  // uncorrected rather than reported as just the offset.
+  const int32_t distanceMm = lastDistanceMm > 0
+    ? static_cast<int32_t>(lastDistanceMm) + distanceOffsetMm : 0;
+
+  sendMessage(true).print("DIST_MM="); sendMessage(true).print(distanceMm);
+  sendMessage(true).print(",LASER_MM="); sendMessage(true).print(lastDistanceMm);
   sendMessage(true).print(",AX="); sendMessage(true).print(ax);
   sendMessage(true).print(",AY="); sendMessage(true).print(ay);
   sendMessage(true).print(",AZ="); sendMessage(true).print(az);
@@ -373,12 +524,14 @@ void takeRotationReading() {
   sendMessage(true).print(",GLEN="); sendMessage(true).print(gLength, 3);
   sendMessage(true).print(",MLEN="); sendMessage(true).print(mLength, 3);
   sendMessage(true).print(",CAL="); sendMessage(true).println(heebCalibrationValid ? "SHOT" : "ROUGH");
+  playSound(distanceMm > 0 && orientationValid ? Sound::Success : Sound::Error);
   reading = false;
   laserCycleState = 0;
 }
 
 void loop() {
   pollCommands();
+  pollButton();
   serviceAccelerometerCalibration();
   serviceMagnetometerCalibration();
   serviceHeebCalibration();

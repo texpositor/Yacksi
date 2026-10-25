@@ -1,5 +1,7 @@
 package me.speleologist.yacsi.ui
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -10,6 +12,7 @@ import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
@@ -21,6 +24,7 @@ import androidx.compose.ui.unit.sp
 import me.speleologist.yacsi.bluetooth.ConnectionState
 import me.speleologist.yacsi.viewmodel.AppMode
 import me.speleologist.yacsi.viewmodel.YacsiViewModel
+import java.time.LocalDate
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -33,13 +37,23 @@ fun MainScreen(
     var showMenu by remember { mutableStateOf(false) }
     var showEraseConfirmDialog by remember { mutableStateOf(false) }
     var showEraseShotConfirmDialog by remember { mutableStateOf(false) }
+    var showDistanceOffsetDialog by remember { mutableStateOf(false) }
+
+    var selectedTab by rememberSaveable { mutableIntStateOf(0) }
 
     val listState = rememberLazyListState()
     val clipboardManager = LocalClipboardManager.current
 
+    val newSurveyLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("text/csv")
+    ) { uri -> uri?.let { viewModel.createSurvey(it) } }
+    val openSurveyLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri -> uri?.let { viewModel.openSurvey(it) } }
+
     // Auto-scroll logs to bottom when new lines arrive
-    LaunchedEffect(uiState.rawLogs.size) {
-        if (uiState.rawLogs.isNotEmpty()) {
+    LaunchedEffect(uiState.rawLogs.size, selectedTab) {
+        if (selectedTab == 1 && uiState.rawLogs.isNotEmpty()) {
             listState.animateScrollToItem(uiState.rawLogs.size - 1)
         }
     }
@@ -114,6 +128,17 @@ fun MainScreen(
                     Text("Cancel")
                 }
             }
+        )
+    }
+
+    if (showDistanceOffsetDialog) {
+        DistanceOffsetDialog(
+            currentOffsetMm = uiState.distanceOffsetMm,
+            onSave = { offsetMm ->
+                showDistanceOffsetDialog = false
+                viewModel.setDistanceOffset(offsetMm)
+            },
+            onDismiss = { showDistanceOffsetDialog = false }
         )
     }
 
@@ -207,6 +232,15 @@ fun MainScreen(
                             expanded = showMenu,
                             onDismissRequest = { showMenu = false }
                         ) {
+                            DropdownMenuItem(
+                                text = { Text("Distance Offset") },
+                                onClick = {
+                                    showMenu = false
+                                    viewModel.requestDistanceOffset()
+                                    showDistanceOffsetDialog = true
+                                }
+                            )
+                            HorizontalDivider()
                             DropdownMenuItem(
                                 text = { Text("Shot Calibration") },
                                 onClick = {
@@ -365,6 +399,10 @@ fun MainScreen(
                             text = buildString {
                                 append(if (reading.calibration == "SHOT") "Shot calibration" else "Rough calibration only")
                                 reading.mLen?.let { append("  ·  field %.3f".format(it)) }
+                                reading.laserMm?.let { laserMm ->
+                                    val offsetMm = (reading.distMm - laserMm).toInt()
+                                    if (offsetMm != 0) append("  ·  distance offset %+d mm".format(offsetMm))
+                                }
                                 if (interference) append("  ·  possible magnetic interference")
                             },
                             style = MaterialTheme.typography.bodySmall,
@@ -417,66 +455,90 @@ fun MainScreen(
                 )
             }
 
-            // Scrolling Output Window (Monospace)
-            Card(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
-            ) {
-                Column(modifier = Modifier.fillMaxSize().padding(8.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = "Output Log",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                        if (uiState.rawLogs.isNotEmpty()) {
-                            IconButton(
-                                onClick = {
-                                    clipboardManager.setText(AnnotatedString(uiState.rawLogs.joinToString("\n")))
-                                },
-                                modifier = Modifier.size(24.dp)
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.ContentCopy,
-                                    contentDescription = "Copy Output Log",
-                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.size(16.dp)
-                                )
+            PrimaryTabRow(selectedTabIndex = selectedTab) {
+                Tab(selected = selectedTab == 0, onClick = { selectedTab = 0 }, text = { Text("Survey") })
+                Tab(selected = selectedTab == 1, onClick = { selectedTab = 1 }, text = { Text("Log") })
+            }
+
+            if (selectedTab == 0) {
+                SurveyPanel(
+                    state = uiState.survey,
+                    onNewSurvey = { newSurveyLauncher.launch("survey-${LocalDate.now()}.csv") },
+                    onOpenSurvey = {
+                        openSurveyLauncher.launch(arrayOf("text/*", "application/csv", "application/octet-stream"))
+                    },
+                    onFromChange = viewModel::setFromStation,
+                    onToChange = viewModel::setToStation,
+                    onLrudChange = viewModel::setLrud,
+                    onTargetChange = viewModel::setShotTarget,
+                    onLrudBeforeLegChange = viewModel::setLrudBeforeLeg,
+                    onUndoLastLeg = viewModel::undoLastLeg,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f)
+                )
+            } else {
+                // Scrolling Output Window (Monospace)
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                ) {
+                    Column(modifier = Modifier.fillMaxSize().padding(8.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "Output Log",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            if (uiState.rawLogs.isNotEmpty()) {
+                                IconButton(
+                                    onClick = {
+                                        clipboardManager.setText(AnnotatedString(uiState.rawLogs.joinToString("\n")))
+                                    },
+                                    modifier = Modifier.size(24.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.ContentCopy,
+                                        contentDescription = "Copy Output Log",
+                                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                }
                             }
                         }
-                    }
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .background(MaterialTheme.colorScheme.surface)
-                            .padding(8.dp)
-                    ) {
-                        if (uiState.rawLogs.isEmpty()) {
-                            Text(
-                                text = "Connected output will appear here...",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.outline,
-                                modifier = Modifier.align(Alignment.Center)
-                            )
-                        } else {
-                            LazyColumn(
-                                state = listState,
-                                modifier = Modifier.fillMaxSize()
-                            ) {
-                                items(uiState.rawLogs) { logLine ->
-                                    Text(
-                                        text = logLine,
-                                        fontFamily = FontFamily.Monospace,
-                                        fontSize = 12.sp,
-                                        color = MaterialTheme.colorScheme.onSurface
-                                    )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .background(MaterialTheme.colorScheme.surface)
+                                .padding(8.dp)
+                        ) {
+                            if (uiState.rawLogs.isEmpty()) {
+                                Text(
+                                    text = "Connected output will appear here...",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.outline,
+                                    modifier = Modifier.align(Alignment.Center)
+                                )
+                            } else {
+                                LazyColumn(
+                                    state = listState,
+                                    modifier = Modifier.fillMaxSize()
+                                ) {
+                                    items(uiState.rawLogs) { logLine ->
+                                        Text(
+                                            text = logLine,
+                                            fontFamily = FontFamily.Monospace,
+                                            fontSize = 12.sp,
+                                            color = MaterialTheme.colorScheme.onSurface
+                                        )
+                                    }
                                 }
                             }
                         }

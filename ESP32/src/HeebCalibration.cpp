@@ -549,7 +549,6 @@ void sendPrompt() {
 void endSession() {
   phase = Phase::Idle;
   turnLaserOff();
-  digitalWrite(CALIBRATION_LED_PIN, LOW);
 }
 
 void runFitAndReview() {
@@ -557,6 +556,7 @@ void runFitAndReview() {
   const char* failure = "Unknown error";
   if (!fitHeeb(shots, pendingResult, failure)) {
     sendMessage(true).printf("CAL,STATE=FAILED,MSG=Calibration fit failed: %s\n", failure);
+    playSound(Sound::Error);
     endSession();
     return;
   }
@@ -580,6 +580,7 @@ void beginShot() {
   settleUntil = millis() + HEEB_SETTLE_MS;
   sampleCount = 0;
   phase = Phase::Settle;
+  playSound(Sound::Beep);
   sendMessage(true).printf("CAL,STATE=SAMPLING,SHOT=%d\n", shots.count + 1);
 }
 
@@ -628,6 +629,7 @@ void completeShot() {
     sendMessage(true).printf(
       "CAL,STATE=REJECT,SHOT=%d,MOVED=%.2f,MSG=Instrument moved during the shot; take the shot again.\n",
       shots.count + 1, movement);
+    playSound(Sound::Error);
     sendPrompt();
     return;
   }
@@ -638,6 +640,7 @@ void completeShot() {
   memcpy(shots.m[index], meanM, sizeof(meanM));
   ++shots.count;
   sendMessage(true).printf("CAL,STATE=SHOT,SHOT=%d,MOVED=%.2f\n", shots.count, movement);
+  playSound(Sound::Success);
 
   if (shots.count >= HEEB_MAX_SHOTS) {
     runFitAndReview();
@@ -649,6 +652,7 @@ void completeShot() {
 void acceptPendingCalibration() {
   if (!saveHeeb(pendingResult.calibration, shots)) {
     sendMessage(true).println("CAL,STATE=FAILED,MSG=Could not save calibration; previous calibration unchanged.");
+    playSound(Sound::Error);
     endSession();
     return;
   }
@@ -676,7 +680,6 @@ void startHeebCalibration() {
   laserCycleState = 0;
   shots = {};
   shots.magic = HEEB_SHOTS_MAGIC;
-  digitalWrite(CALIBRATION_LED_PIN, HIGH);
   turnLaserOn();
   phase = Phase::Aim;
   sendMessage(true).printf("CAL,STATE=START,GROUPS=%d,ROLLS=%d,MINGROUPS=%d\n",
@@ -789,7 +792,6 @@ void refitStoredHeebShots() {
   }
   reading = false;
   laserCycleState = 0;
-  digitalWrite(CALIBRATION_LED_PIN, HIGH);
   phase = Phase::Aim;  // So runFitAndReview's failure path ends the session cleanly.
   runFitAndReview();
 }

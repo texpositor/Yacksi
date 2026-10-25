@@ -7,7 +7,9 @@
 #define RXD2 33
 #define TXD2 32
 #define ENA_PIN 25
-#define CALIBRATION_LED_PIN 4
+// Momentary push button to GND (internal pull-up) and passive piezo buzzer.
+#define BUTTON_PIN 27
+#define BUZZER_PIN 26
 
 #define SPI_SCK 18
 #define SPI_MISO 19
@@ -116,6 +118,15 @@ extern uint8_t laserCycleState;
 
 void turnLaserOff();
 void turnLaserOn();
+
+// Buzzer sounds play in the background so loop() is not held up.
+enum class Sound : uint8_t {
+  Beep,     // single short beep: button press accepted, calibration point recorded
+  Success,  // two beeps: reading or calibration completed
+  Error     // three descending tones: reading or calibration failed
+};
+void initBuzzer();
+void playSound(Sound sound);
 
 void adxl355_writeRegister(uint8_t reg, uint8_t value);
 uint8_t adxl355_readRegister(uint8_t reg);

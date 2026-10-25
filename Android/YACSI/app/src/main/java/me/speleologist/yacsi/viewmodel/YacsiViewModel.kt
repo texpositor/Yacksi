@@ -1,19 +1,34 @@
 package me.speleologist.yacsi.viewmodel
 
+import android.app.Application
 import android.bluetooth.BluetoothDevice
-import androidx.lifecycle.ViewModel
+import android.net.Uri
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import me.speleologist.yacsi.bluetooth.BluetoothService
 import me.speleologist.yacsi.bluetooth.ConnectionState
 import me.speleologist.yacsi.protocol.CalMessage
+import me.speleologist.yacsi.protocol.DistanceOffsetMessage
 import me.speleologist.yacsi.protocol.YacsiReading
 import me.speleologist.yacsi.protocol.parseCalLine
+import me.speleologist.yacsi.protocol.parseDistanceOffsetLine
 import me.speleologist.yacsi.protocol.parseYacsiLine
+import me.speleologist.yacsi.survey.LrudSide
+import me.speleologist.yacsi.survey.SurveyLeg
+import me.speleologist.yacsi.survey.SurveyStorage
+import me.speleologist.yacsi.survey.nextStation
+import me.speleologist.yacsi.survey.sanitizeStation
+import me.speleologist.yacsi.survey.stations
+import java.time.LocalDateTime
+import java.time.temporal.ChronoUnit
+import java.util.Locale
 
 enum class AppMode {
     NORMAL,
@@ -58,6 +73,29 @@ data class ShotCalibrationState(
     val canFinishEarly: Boolean get() = completedGroups >= minGroups
 }
 
+/** What the next reading from the device is recorded as. */
+enum class ShotTarget(val label: String, val side: LrudSide?) {
+    LEG("Leg", null),
+    LEFT("L", LrudSide.LEFT),
+    RIGHT("R", LrudSide.RIGHT),
+    UP("U", LrudSide.UP),
+    DOWN("D", LrudSide.DOWN)
+}
+
+data class SurveyState(
+    val fileName: String? = null, // null when no survey is open
+    val legs: List<SurveyLeg> = emptyList(),
+    val fromStation: String = "",
+    val toStation: String = "",
+    val lrud: Map<LrudSide, String> = emptyMap(), // at the From station, saved with the next leg
+    val target: ShotTarget = ShotTarget.LEG,
+    val lrudBeforeLeg: Boolean = false, // start each station with L, R, U, D before the leg
+    val notice: String? = null,
+    val noticeIsError: Boolean = false
+) {
+    val isOpen: Boolean get() = fileName != null
+}
+
 data class YacsiUiState(
     val connectionState: ConnectionState = ConnectionState.DISCONNECTED,
     val connectedDeviceName: String? = null,
@@ -67,16 +105,25 @@ data class YacsiUiState(
     val rawLogs: List<String> = emptyList(),
     val warningMessage: String? = null,
     val infoMessage: String? = null,
-    val shotCalibration: ShotCalibrationState = ShotCalibrationState()
+    val shotCalibration: ShotCalibrationState = ShotCalibrationState(),
+    val distanceOffsetMm: Int? = null, // null until the device has reported it
+    val survey: SurveyState = SurveyState()
 )
 
-class YacsiViewModel : ViewModel() {
+class YacsiViewModel(application: Application) : AndroidViewModel(application) {
     private val bluetoothService = BluetoothService()
+    private val surveyStorage = SurveyStorage(application)
+    private var surveyUri: Uri? = null
+    // Serialises survey file writes so they land in order.
+    private val surveyDispatcher = Dispatchers.IO.limitedParallelism(1)
 
-    private val _uiState = MutableStateFlow(YacsiUiState())
+    private val _uiState = MutableStateFlow(
+        YacsiUiState(survey = SurveyState(lrudBeforeLeg = surveyStorage.lrudBeforeLeg))
+    )
     val uiState: StateFlow<YacsiUiState> = _uiState.asStateFlow()
 
     init {
+        surveyStorage.lastSurveyUri()?.let { openSurvey(it) }
         viewModelScope.launch {
             launch {
                 bluetoothService.connectionState.collect { state ->
@@ -209,6 +256,202 @@ class YacsiViewModel : ViewModel() {
         sendCommand("E", "Erase Shot Calibration")
     }
 
+    // --- Distance offset ---
+    // A fixed correction the device adds to every laser distance; it is stored
+    // on the device and reported back on DIST_OFFSET_MM=... lines.
+
+    fun requestDistanceOffset() {
+        sendCommand("O", "Show Distance Offset")
+    }
+
+    fun setDistanceOffset(offsetMm: Int) {
+        sendCommand("O$offsetMm", "Set Distance Offset")
+    }
+
+    // --- Survey recording ---
+    // Readings arrive whether the device button or the app triggered them; each
+    // is recorded as the current shot target (a leg or one of L/R/U/D).
+
+    fun createSurvey(uri: Uri) {
+        viewModelScope.launch {
+            try {
+                val name = withContext(surveyDispatcher) {
+                    surveyStorage.save(uri, emptyList())
+                    surveyStorage.remember(uri)
+                    surveyStorage.displayName(uri)
+                }
+                surveyUri = uri
+                updateSurvey {
+                    SurveyState(
+                        fileName = name,
+                        lrudBeforeLeg = it.lrudBeforeLeg,
+                        target = initialTarget(it.lrudBeforeLeg),
+                        notice = "New survey started. Enter the From station."
+                    )
+                }
+            } catch (e: Exception) {
+                surveyNotice("Could not create survey file: ${e.message}", isError = true)
+            }
+        }
+    }
+
+    fun openSurvey(uri: Uri) {
+        viewModelScope.launch {
+            try {
+                val (name, legs) = withContext(surveyDispatcher) {
+                    surveyStorage.remember(uri)
+                    surveyStorage.displayName(uri) to surveyStorage.load(uri)
+                }
+                surveyUri = uri
+                // Continue from the end of the last leg.
+                val from = legs.lastOrNull()?.to ?: ""
+                updateSurvey {
+                    SurveyState(
+                        fileName = name,
+                        legs = legs,
+                        fromStation = from,
+                        toStation = nextStation(from, legs.stations()) ?: "",
+                        lrudBeforeLeg = it.lrudBeforeLeg,
+                        target = initialTarget(it.lrudBeforeLeg),
+                        notice = "${legs.size} legs loaded."
+                    )
+                }
+            } catch (e: Exception) {
+                surveyNotice("Could not open survey file: ${e.message}", isError = true)
+            }
+        }
+    }
+
+    fun setFromStation(text: String) {
+        val from = sanitizeStation(text)
+        updateSurvey {
+            it.copy(
+                fromStation = from,
+                toStation = nextStation(from, it.legs.stations()) ?: it.toStation
+            )
+        }
+    }
+
+    fun setToStation(text: String) {
+        updateSurvey { it.copy(toStation = sanitizeStation(text)) }
+    }
+
+    fun setLrud(side: LrudSide, text: String) {
+        val value = text.filter { it.isDigit() || it == '.' }
+        updateSurvey { it.copy(lrud = it.lrud + (side to value)) }
+    }
+
+    fun setShotTarget(target: ShotTarget) {
+        updateSurvey { it.copy(target = target) }
+    }
+
+    fun setLrudBeforeLeg(enabled: Boolean) {
+        surveyStorage.lrudBeforeLeg = enabled
+        updateSurvey { it.copy(lrudBeforeLeg = enabled) }
+    }
+
+    /** Removes the last leg and puts its stations and LRUD back for re-shooting. */
+    fun undoLastLeg() {
+        val survey = _uiState.value.survey
+        val leg = survey.legs.lastOrNull() ?: return
+        val legs = survey.legs.dropLast(1)
+        updateSurvey {
+            it.copy(
+                legs = legs,
+                fromStation = leg.from,
+                toStation = leg.to,
+                lrud = leg.lrud.mapValues { (_, metres) -> formatMetres(metres) },
+                target = ShotTarget.LEG,
+                notice = "Removed leg ${leg.from} → ${leg.to}.",
+                noticeIsError = false
+            )
+        }
+        saveSurvey(legs)
+    }
+
+    private fun recordSurveyShot(reading: YacsiReading) {
+        val survey = _uiState.value.survey
+        if (!survey.isOpen) return
+        if (reading.distMm <= 0f) {
+            surveyNotice("Laser shot failed; nothing recorded.", isError = true)
+            return
+        }
+        val distanceM = reading.distMm / 1000.0
+
+        val side = survey.target.side
+        if (side != null) {
+            updateSurvey {
+                it.copy(
+                    lrud = it.lrud + (side to formatMetres(distanceM)),
+                    // L -> R -> U -> D -> leg
+                    target = if (it.target == ShotTarget.DOWN) ShotTarget.LEG else ShotTarget.entries[it.target.ordinal + 1],
+                    notice = "${side.label} ${formatMetres(distanceM)} m at ${it.fromStation.ifBlank { "From station" }}.",
+                    noticeIsError = false
+                )
+            }
+            return
+        }
+
+        val bearing = reading.bearing
+        if (bearing == null) {
+            surveyNotice("No bearing (check the calibration); leg not recorded.", isError = true)
+            return
+        }
+        if (survey.fromStation.isBlank() || survey.toStation.isBlank()) {
+            surveyNotice("Enter the From and To stations; leg not recorded.", isError = true)
+            return
+        }
+
+        val leg = SurveyLeg(
+            from = survey.fromStation,
+            to = survey.toStation,
+            distanceM = distanceM,
+            bearing = bearing.toDouble(),
+            inclination = reading.incl.toDouble(),
+            lrud = survey.lrud.mapNotNull { (lrudSide, text) ->
+                text.toDoubleOrNull()?.let { lrudSide to it }
+            }.toMap(),
+            time = LocalDateTime.now().truncatedTo(ChronoUnit.SECONDS).toString()
+        )
+        val legs = survey.legs + leg
+        updateSurvey {
+            it.copy(
+                legs = legs,
+                fromStation = leg.to,
+                toStation = nextStation(leg.to, legs.stations()) ?: "",
+                lrud = emptyMap(),
+                target = initialTarget(it.lrudBeforeLeg),
+                notice = "Recorded ${leg.from} → ${leg.to}.",
+                noticeIsError = false
+            )
+        }
+        saveSurvey(legs)
+    }
+
+    private fun saveSurvey(legs: List<SurveyLeg>) {
+        val uri = surveyUri ?: return
+        viewModelScope.launch {
+            try {
+                withContext(surveyDispatcher) { surveyStorage.save(uri, legs) }
+            } catch (e: Exception) {
+                surveyNotice("Could not write survey file: ${e.message}", isError = true)
+            }
+        }
+    }
+
+    private fun initialTarget(lrudBeforeLeg: Boolean) =
+        if (lrudBeforeLeg) ShotTarget.LEFT else ShotTarget.LEG
+
+    private fun formatMetres(metres: Double) = "%.2f".format(Locale.US, metres)
+
+    private fun surveyNotice(message: String, isError: Boolean) {
+        updateSurvey { it.copy(notice = message, noticeIsError = isError) }
+    }
+
+    private fun updateSurvey(transform: (SurveyState) -> SurveyState) {
+        _uiState.update { it.copy(survey = transform(it.survey)) }
+    }
+
     fun sendHelp() {
         bluetoothService.sendCommand("?")
     }
@@ -241,10 +484,17 @@ class YacsiViewModel : ViewModel() {
             return
         }
 
+        val offset = parseDistanceOffsetLine(line)
+        if (offset != null) {
+            handleDistanceOffsetMessage(offset)
+            return
+        }
+
         // Check if line is a sensor reading
         val reading = parseYacsiLine(line)
         if (reading != null) {
             _uiState.update { it.copy(latestReading = reading) }
+            recordSurveyShot(reading)
         }
 
         // The rough accelerometer/magnetometer calibrations only report in free text.
@@ -323,6 +573,25 @@ class YacsiViewModel : ViewModel() {
             )
             "DISCARDED", "ABORTED" -> endShotCalibration(info = cal.message)
             "FAILED" -> endShotCalibration(warning = cal.message ?: "Shot calibration failed.")
+        }
+    }
+
+    private fun handleDistanceOffsetMessage(message: DistanceOffsetMessage) {
+        val offsetText = "%+d mm".format(message.offsetMm)
+        _uiState.update {
+            it.copy(
+                distanceOffsetMm = message.offsetMm,
+                infoMessage = if (message.status == "SAVED") {
+                    "Distance offset set to $offsetText."
+                } else {
+                    it.infoMessage
+                },
+                warningMessage = when (message.status) {
+                    "INVALID" -> "The device rejected the distance offset; it is still $offsetText."
+                    "FAILED" -> "The device could not save the distance offset; it is still $offsetText."
+                    else -> it.warningMessage
+                }
+            )
         }
     }
 

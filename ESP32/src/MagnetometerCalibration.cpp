@@ -361,7 +361,6 @@ void startMagnetometerCalibration() {
   reading = false;
   laserCycleState = 0;
   turnLaserOff();
-  digitalWrite(CALIBRATION_LED_PIN, HIGH);
   magSampleCount = 0;
   magCalibrationActive = true;
   magCalibrationStartTime = millis();
@@ -372,7 +371,6 @@ void startMagnetometerCalibration() {
 }
 
 bool endMagnetometerCalibration() {
-  digitalWrite(CALIBRATION_LED_PIN, LOW);
   return true;
 }
 
@@ -386,6 +384,7 @@ void finishMagnetometerCalibration() {
     sendMessage(bluetoothAvailable).print("Calibration failed: at least ");
     sendMessage(bluetoothAvailable).print(MAG_CAL_MIN_SAMPLES);
     sendMessage(bluetoothAvailable).println(" samples are required; existing calibration was not changed.");
+    playSound(Sound::Error);
     return;
   }
 
@@ -396,6 +395,7 @@ void finishMagnetometerCalibration() {
     sendMessage(bluetoothAvailable).print("Collected magnetometer samples: ");
     sendMessage(bluetoothAvailable).println(static_cast<unsigned int>(magSampleCount));
     sendMessage(bluetoothAvailable).println("Magnetometer ellipsoid fit failed (insufficient orientation coverage or singular fit); existing calibration was not changed.");
+    playSound(Sound::Error);
     return;
   }
   if (!saveMagCalibration(newOffset, newMatrix)) {
@@ -403,6 +403,7 @@ void finishMagnetometerCalibration() {
     sendMessage(bluetoothAvailable).print("Collected magnetometer samples: ");
     sendMessage(bluetoothAvailable).println(static_cast<unsigned int>(magSampleCount));
     sendMessage(bluetoothAvailable).println("Could not save magnetometer calibration; existing calibration was not changed.");
+    playSound(Sound::Error);
     return;
   }
 
@@ -427,6 +428,7 @@ void finishMagnetometerCalibration() {
     sendMessage(bluetoothAvailable).println(magMatrix[row][2], 8);
   }
   sendMessage(bluetoothAvailable).println("Magnetometer calibration saved.");
+  playSound(Sound::Success);
 }
 
 void serviceMagnetometerCalibration() {

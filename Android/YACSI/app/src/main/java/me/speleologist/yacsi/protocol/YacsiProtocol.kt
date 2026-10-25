@@ -1,7 +1,8 @@
 package me.speleologist.yacsi.protocol
 
 data class YacsiReading(
-    val distMm: Float = 0f,
+    val distMm: Float = 0f, // laser distance with the device's distance offset applied
+    val laserMm: Float? = null, // uncorrected laser distance
     val ax: Int = 0,
     val ay: Int = 0,
     val az: Int = 0,
@@ -42,10 +43,28 @@ fun parseCalLine(line: String): CalMessage? {
     return CalMessage(state, fields, message)
 }
 
+/**
+ * Distance offset status line from the device:
+ * `DIST_OFFSET_MM=<mm>,STATUS=CURRENT|SAVED|INVALID|FAILED`
+ * where DIST_OFFSET_MM is always the offset now in use.
+ */
+data class DistanceOffsetMessage(val offsetMm: Int, val status: String)
+
+fun parseDistanceOffsetLine(line: String): DistanceOffsetMessage? {
+    if (!line.startsWith("DIST_OFFSET_MM=")) return null
+    val fields = line.split(",").mapNotNull { part ->
+        val kv = part.split("=", limit = 2)
+        if (kv.size == 2) kv[0].trim() to kv[1].trim() else null
+    }.toMap()
+    val offset = fields["DIST_OFFSET_MM"]?.toIntOrNull() ?: return null
+    return DistanceOffsetMessage(offset, fields["STATUS"] ?: "CURRENT")
+}
+
 fun parseYacsiLine(line: String): YacsiReading? {
     if (!line.contains("DIST_MM=")) return null
     try {
         var distMm = 0f
+        var laserMm: Float? = null
         var ax = 0
         var ay = 0
         var az = 0
@@ -65,6 +84,7 @@ fun parseYacsiLine(line: String): YacsiReading? {
                 val value = kv[1].trim()
                 when (key) {
                     "DIST_MM" -> distMm = value.toFloatOrNull() ?: 0f
+                    "LASER_MM" -> laserMm = value.toFloatOrNull()
                     "AX" -> ax = value.toIntOrNull() ?: 0
                     "AY" -> ay = value.toIntOrNull() ?: 0
                     "AZ" -> az = value.toIntOrNull() ?: 0
@@ -86,6 +106,7 @@ fun parseYacsiLine(line: String): YacsiReading? {
         }
         return YacsiReading(
             distMm = distMm,
+            laserMm = laserMm,
             ax = ax,
             ay = ay,
             az = az,
