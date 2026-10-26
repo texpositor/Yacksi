@@ -1,17 +1,21 @@
 package me.speleologist.yacsi.ui
 
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import me.speleologist.yacsi.survey.LrudSide
@@ -88,20 +92,18 @@ fun SurveyPanel(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            OutlinedTextField(
+            CompactTextField(
                 value = state.fromStation,
                 onValueChange = onFromChange,
-                label = { Text("From") },
-                singleLine = true,
+                label = "From",
                 keyboardOptions = stationKeyboard,
                 modifier = Modifier.weight(1f)
             )
             Text("→", style = MaterialTheme.typography.titleMedium)
-            OutlinedTextField(
+            CompactTextField(
                 value = state.toStation,
                 onValueChange = onToChange,
-                label = { Text("To") },
-                singleLine = true,
+                label = "To",
                 keyboardOptions = stationKeyboard,
                 modifier = Modifier.weight(1f)
             )
@@ -126,11 +128,10 @@ fun SurveyPanel(
             verticalAlignment = Alignment.CenterVertically
         ) {
             LrudSide.entries.forEach { side ->
-                OutlinedTextField(
+                CompactTextField(
                     value = state.lrud[side] ?: "",
                     onValueChange = { onLrudChange(side, it) },
-                    label = { Text(side.label) },
-                    singleLine = true,
+                    label = side.label,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                     modifier = Modifier.weight(1f)
                 )
@@ -166,6 +167,53 @@ fun SurveyPanel(
         LazyColumn(modifier = Modifier.fillMaxWidth().weight(1f)) {
             items(state.legs.asReversed()) { leg -> LegRow(leg) }
         }
+    }
+}
+
+/**
+ * An outlined text field with tighter inner padding and no minimum height, so the
+ * station and LRUD rows take less vertical space than a standard OutlinedTextField.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun CompactTextField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    label: String,
+    keyboardOptions: KeyboardOptions,
+    modifier: Modifier = Modifier
+) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val colors = OutlinedTextFieldDefaults.colors()
+    BasicTextField(
+        value = value,
+        onValueChange = onValueChange,
+        singleLine = true,
+        keyboardOptions = keyboardOptions,
+        textStyle = MaterialTheme.typography.bodyMedium.copy(color = MaterialTheme.colorScheme.onSurface),
+        cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+        interactionSource = interactionSource,
+        modifier = modifier
+    ) { innerTextField ->
+        OutlinedTextFieldDefaults.DecorationBox(
+            value = value,
+            innerTextField = innerTextField,
+            enabled = true,
+            singleLine = true,
+            visualTransformation = VisualTransformation.None,
+            interactionSource = interactionSource,
+            label = { Text(label) },
+            colors = colors,
+            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
+            container = {
+                OutlinedTextFieldDefaults.Container(
+                    enabled = true,
+                    isError = false,
+                    interactionSource = interactionSource,
+                    colors = colors
+                )
+            }
+        )
     }
 }
 

@@ -413,27 +413,6 @@ fun MainScreen(
                             }
                         )
                     }
-
-                    Spacer(modifier = Modifier.height(8.dp))
-                    HorizontalDivider()
-                    Spacer(modifier = Modifier.height(8.dp))
-
-                    // Secondary Panel: Raw AX, AY, AZ, MX, MY, MZ
-                    Text(
-                        text = "Raw Sensors (AX, AY, AZ, MX, MY, MZ)",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.outline
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = if (reading != null) {
-                            "A: [${reading.ax}, ${reading.ay}, ${reading.az}]  |  M: [${reading.mx}, ${reading.my}, ${reading.mz}]"
-                        } else {
-                            "A: [---] | M: [---]"
-                        },
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontFamily = FontFamily.Monospace
-                    )
                 }
             }
 
