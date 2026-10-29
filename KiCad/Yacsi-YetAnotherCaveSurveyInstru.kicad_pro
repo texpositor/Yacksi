@@ -256,7 +256,7 @@
     "pinned_symbol_libs": []
   },
   "meta": {
-    "filename": "ESP-Res.kicad_pro",
+    "filename": "Yacsi-YetAnotherCaveSurveyInstru.kicad_pro",
     "version": 3
   },
   "net_settings": {
@@ -411,17 +411,17 @@
     "subpart_id_separator": 0,
     "top_level_sheets": [
       {
-        "filename": "ESP-Res.kicad_sch",
+        "filename": "Yacsi-YetAnotherCaveSurveyInstru.kicad_sch",
         "name": "Root",
-        "uuid": "d2205514-4143-4b2b-9824-d48f3807e986"
+        "uuid": "374eff6d-b681-474b-b6fc-0227f01896e1"
       }
     ],
-    "used_designators": "C1-4,R5-6,D3,P1,U4",
+    "used_designators": "",
     "variants": []
   },
   "sheets": [
     [
-      "d2205514-4143-4b2b-9824-d48f3807e986",
+      "374eff6d-b681-474b-b6fc-0227f01896e1",
       "Root"
     ]
   ],
