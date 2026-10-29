@@ -43,17 +43,17 @@ class SurveyStorage(context: Context) {
             if (cursor.moveToFirst()) cursor.getString(0) else null
         } ?: uri.lastPathSegment ?: "survey"
 
-    fun load(uri: Uri): List<SurveyLeg> {
+    fun load(uri: Uri): SurveyData {
         val text = resolver.openInputStream(uri)?.use { it.readBytes().toString(Charsets.UTF_8) }
             ?: throw java.io.IOException("Cannot open survey file")
         return SurveyCsv.parse(text)
     }
 
     /** Rewrites the whole file; surveys are small and this also handles undo. */
-    fun save(uri: Uri, legs: List<SurveyLeg>) {
+    fun save(uri: Uri, data: SurveyData) {
         // "wt" truncates; plain "w" does not on some providers.
         resolver.openOutputStream(uri, "wt")?.use {
-            it.write(SurveyCsv.format(legs).toByteArray(Charsets.UTF_8))
+            it.write(SurveyCsv.format(data).toByteArray(Charsets.UTF_8))
         } ?: throw java.io.IOException("Cannot write survey file")
     }
 

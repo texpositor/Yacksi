@@ -45,7 +45,8 @@ class MainActivity : ComponentActivity() {
     private fun checkAndRequestBluetoothPermissions() {
         val permissions = arrayOf(
             Manifest.permission.BLUETOOTH_CONNECT,
-            Manifest.permission.BLUETOOTH_SCAN
+            Manifest.permission.BLUETOOTH_SCAN,
+            Manifest.permission.RECORD_AUDIO
         )
         val missingPermissions = permissions.filter {
             ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED

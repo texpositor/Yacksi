@@ -6,9 +6,20 @@ import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -21,11 +32,16 @@ import me.speleologist.yacsi.protocol.parseCalLine
 import me.speleologist.yacsi.protocol.parseDistanceOffsetLine
 import me.speleologist.yacsi.protocol.parseYacsiLine
 import me.speleologist.yacsi.survey.LrudSide
+import me.speleologist.yacsi.survey.StationLrud
+import me.speleologist.yacsi.survey.SurveyData
 import me.speleologist.yacsi.survey.SurveyLeg
 import me.speleologist.yacsi.survey.SurveyStorage
 import me.speleologist.yacsi.survey.nextStation
 import me.speleologist.yacsi.survey.sanitizeStation
 import me.speleologist.yacsi.survey.stations
+import me.speleologist.yacsi.voice.VoiceAction
+import me.speleologist.yacsi.voice.VoiceCommandManager
+import me.speleologist.yacsi.voice.VoiceState
 import java.time.LocalDateTime
 import java.time.temporal.ChronoUnit
 import java.util.Locale
@@ -85,15 +101,20 @@ enum class ShotTarget(val label: String, val side: LrudSide?) {
 data class SurveyState(
     val fileName: String? = null, // null when no survey is open
     val legs: List<SurveyLeg> = emptyList(),
-    val fromStation: String = "",
+    val atStation: String = "",
     val toStation: String = "",
-    val lrud: Map<LrudSide, String> = emptyMap(), // at the From station, saved with the next leg
+    val lrud: Map<LrudSide, String> = emptyMap(), // the LRUD boxes, for the At station
+    // LRUD at stations with no leg from them yet, kept in step with the boxes and
+    // written to the file as station rows so nothing is lost before the next leg
+    val stationLrud: Map<String, StationLrud> = emptyMap(),
     val target: ShotTarget = ShotTarget.LEG,
     val lrudBeforeLeg: Boolean = false, // start each station with L, R, U, D before the leg
     val notice: String? = null,
     val noticeIsError: Boolean = false
 ) {
     val isOpen: Boolean get() = fileName != null
+
+    fun toData() = SurveyData(legs, stationLrud.values.toList())
 }
 
 data class YacsiUiState(
@@ -107,13 +128,16 @@ data class YacsiUiState(
     val infoMessage: String? = null,
     val shotCalibration: ShotCalibrationState = ShotCalibrationState(),
     val distanceOffsetMm: Int? = null, // null until the device has reported it
-    val survey: SurveyState = SurveyState()
+    val survey: SurveyState = SurveyState(),
+    val voiceState: VoiceState = VoiceState()
 )
 
 class YacsiViewModel(application: Application) : AndroidViewModel(application) {
     private val bluetoothService = BluetoothService()
     private val surveyStorage = SurveyStorage(application)
+    private val voiceCommandManager = VoiceCommandManager(application)
     private var surveyUri: Uri? = null
+    private var lrudSaveJob: Job? = null
     // Serialises survey file writes so they land in order.
     private val surveyDispatcher = Dispatchers.IO.limitedParallelism(1)
 
@@ -122,12 +146,62 @@ class YacsiViewModel(application: Application) : AndroidViewModel(application) {
     )
     val uiState: StateFlow<YacsiUiState> = _uiState.asStateFlow()
 
+    // Short-lived status messages shown as toasts; buffered until the UI collects them
+    private val _toasts = Channel<String>(Channel.BUFFERED)
+    val toasts: Flow<String> = _toasts.receiveAsFlow()
+
+    // LRUD field the UI should focus next, after a value is entered by voice; dropped
+    // when the survey tab isn't showing, so it doesn't pop up the keyboard later
+    private val _lrudFocusRequests = MutableSharedFlow<LrudSide>(
+        extraBufferCapacity = 1, onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+    val lrudFocusRequests: Flow<LrudSide> = _lrudFocusRequests.asSharedFlow()
+
     init {
         surveyStorage.lastSurveyUri()?.let { openSurvey(it) }
+
+        voiceCommandManager.onCommandRecognized = { action ->
+            viewModelScope.launch {
+                when (action) {
+                    VoiceAction.SetTargetLeg -> {
+                        setShotTarget(ShotTarget.LEG)
+                        toast("Voice: shot set to Leg")
+                    }
+                    VoiceAction.SetTargetSection -> {
+                        setShotTarget(ShotTarget.LEFT)
+                        toast("Voice: shot set to L (section)")
+                    }
+                    is VoiceAction.SetLrud -> setLrudFromVoice(action.side, action.millimetres)
+                    is VoiceAction.MissingNumber -> toast("Voice: heard ${action.side.label} but no number")
+                }
+            }
+        }
+
+        viewModelScope.launch {
+            voiceCommandManager.state.collect { vState ->
+                _uiState.update { it.copy(voiceState = vState) }
+            }
+        }
+
+        viewModelScope.launch {
+            // Skip the initial "Voice inactive" so nothing pops up at startup
+            voiceCommandManager.state.map { it.statusMessage }.distinctUntilChanged().drop(1)
+                .collect { toast(it) }
+        }
+
         viewModelScope.launch {
             launch {
+                var previous = bluetoothService.connectionState.value
                 bluetoothService.connectionState.collect { state ->
                     _uiState.update { it.copy(connectionState = state) }
+                    val name = _uiState.value.connectedDeviceName ?: "Yacksi"
+                    // Only announce real transitions; auto-reconnect cycles through CONNECTING quietly
+                    if (state == ConnectionState.CONNECTED && previous != ConnectionState.CONNECTED) {
+                        toast("Connected to $name")
+                    } else if (state == ConnectionState.DISCONNECTED && previous == ConnectionState.CONNECTED) {
+                        toast(if (bluetoothService.isAutoReconnectEnabled.value) "Lost $name, reconnecting…" else "Disconnected")
+                    }
+                    previous = state
                     if (state == ConnectionState.DISCONNECTED && !_uiState.value.isAutoReconnectEnabled) {
                         _uiState.update { it.copy(appMode = AppMode.NORMAL) }
                     }
@@ -276,7 +350,7 @@ class YacsiViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             try {
                 val name = withContext(surveyDispatcher) {
-                    surveyStorage.save(uri, emptyList())
+                    surveyStorage.save(uri, SurveyData())
                     surveyStorage.remember(uri)
                     surveyStorage.displayName(uri)
                 }
@@ -286,7 +360,7 @@ class YacsiViewModel(application: Application) : AndroidViewModel(application) {
                         fileName = name,
                         lrudBeforeLeg = it.lrudBeforeLeg,
                         target = initialTarget(it.lrudBeforeLeg),
-                        notice = "New survey started. Enter the From station."
+                        notice = "New survey started. Enter the At station."
                     )
                 }
             } catch (e: Exception) {
@@ -298,19 +372,23 @@ class YacsiViewModel(application: Application) : AndroidViewModel(application) {
     fun openSurvey(uri: Uri) {
         viewModelScope.launch {
             try {
-                val (name, legs) = withContext(surveyDispatcher) {
+                val (name, data) = withContext(surveyDispatcher) {
                     surveyStorage.remember(uri)
                     surveyStorage.displayName(uri) to surveyStorage.load(uri)
                 }
                 surveyUri = uri
+                val legs = data.legs
+                val stationLrud = data.stationLrud.associateBy { it.station }
                 // Continue from the end of the last leg.
-                val from = legs.lastOrNull()?.to ?: ""
+                val at = legs.lastOrNull()?.to ?: ""
                 updateSurvey {
                     SurveyState(
                         fileName = name,
                         legs = legs,
-                        fromStation = from,
-                        toStation = nextStation(from, legs.stations()) ?: "",
+                        atStation = at,
+                        toStation = nextStation(at, legs.stations()) ?: "",
+                        lrud = stationLrud[at]?.lrud.toLrudText(),
+                        stationLrud = stationLrud,
                         lrudBeforeLeg = it.lrudBeforeLeg,
                         target = initialTarget(it.lrudBeforeLeg),
                         notice = "${legs.size} legs loaded."
@@ -322,14 +400,21 @@ class YacsiViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun setFromStation(text: String) {
-        val from = sanitizeStation(text)
+    fun setAtStation(text: String) {
+        val at = sanitizeStation(text)
         updateSurvey {
-            it.copy(
-                fromStation = from,
-                toStation = nextStation(from, it.legs.stations()) ?: it.toStation
-            )
+            val known = it.legs.stations()
+            val stored = it.stationLrud[at]
+            val moved = if (stored == null && it.atStation !in known) {
+                // A new or mistyped name: the LRUD entered so far moves with it
+                it.copy(atStation = at, stationLrud = it.stationLrud - it.atStation).withLrud(it.lrud)
+            } else {
+                // A real station keeps its LRUD; show what is stored for this one
+                it.copy(atStation = at, lrud = stored?.lrud.toLrudText())
+            }
+            moved.copy(toStation = nextStation(at, known) ?: it.toStation)
         }
+        scheduleLrudSave()
     }
 
     fun setToStation(text: String) {
@@ -338,7 +423,8 @@ class YacsiViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setLrud(side: LrudSide, text: String) {
         val value = text.filter { it.isDigit() || it == '.' }
-        updateSurvey { it.copy(lrud = it.lrud + (side to value)) }
+        updateSurvey { it.withLrud(it.lrud + (side to value)) }
+        scheduleLrudSave()
     }
 
     fun setShotTarget(target: ShotTarget) {
@@ -358,15 +444,14 @@ class YacsiViewModel(application: Application) : AndroidViewModel(application) {
         updateSurvey {
             it.copy(
                 legs = legs,
-                fromStation = leg.from,
+                atStation = leg.from,
                 toStation = leg.to,
-                lrud = leg.lrud.mapValues { (_, metres) -> formatMetres(metres) },
                 target = ShotTarget.LEG,
                 notice = "Removed leg ${leg.from} → ${leg.to}.",
                 noticeIsError = false
-            )
+            ).withLrud(leg.lrud.toLrudText()) // back to a station row until re-shot
         }
-        saveSurvey(legs)
+        saveSurvey()
     }
 
     private fun recordSurveyShot(reading: YacsiReading) {
@@ -381,14 +466,13 @@ class YacsiViewModel(application: Application) : AndroidViewModel(application) {
         val side = survey.target.side
         if (side != null) {
             updateSurvey {
-                it.copy(
-                    lrud = it.lrud + (side to formatMetres(distanceM)),
-                    // L -> R -> U -> D -> leg
-                    target = if (it.target == ShotTarget.DOWN) ShotTarget.LEG else ShotTarget.entries[it.target.ordinal + 1],
-                    notice = "${side.label} ${formatMetres(distanceM)} m at ${it.fromStation.ifBlank { "From station" }}.",
+                it.withLrud(it.lrud + (side to formatMetres(distanceM))).copy(
+                    target = nextTarget(it.target),
+                    notice = "${side.label} ${formatMetres(distanceM)} m at ${it.atStation.ifBlank { "the At station" }}.",
                     noticeIsError = false
                 )
             }
+            saveSurvey()
             return
         }
 
@@ -397,50 +481,104 @@ class YacsiViewModel(application: Application) : AndroidViewModel(application) {
             surveyNotice("No bearing (check the calibration); leg not recorded.", isError = true)
             return
         }
-        if (survey.fromStation.isBlank() || survey.toStation.isBlank()) {
-            surveyNotice("Enter the From and To stations; leg not recorded.", isError = true)
+        if (survey.atStation.isBlank() || survey.toStation.isBlank()) {
+            surveyNotice("Enter the At and To stations; leg not recorded.", isError = true)
             return
         }
 
         val leg = SurveyLeg(
-            from = survey.fromStation,
+            from = survey.atStation,
             to = survey.toStation,
             distanceM = distanceM,
             bearing = bearing.toDouble(),
             inclination = reading.incl.toDouble(),
-            lrud = survey.lrud.mapNotNull { (lrudSide, text) ->
-                text.toDoubleOrNull()?.let { lrudSide to it }
-            }.toMap(),
-            time = LocalDateTime.now().truncatedTo(ChronoUnit.SECONDS).toString()
+            lrud = survey.lrud.parseLrud(),
+            time = now()
         )
         val legs = survey.legs + leg
         updateSurvey {
+            // The leg now carries the LRUD for its From station
+            val stationLrud = it.stationLrud - leg.from
             it.copy(
                 legs = legs,
-                fromStation = leg.to,
+                atStation = leg.to,
                 toStation = nextStation(leg.to, legs.stations()) ?: "",
-                lrud = emptyMap(),
+                lrud = stationLrud[leg.to]?.lrud.toLrudText(),
+                stationLrud = stationLrud,
                 target = initialTarget(it.lrudBeforeLeg),
                 notice = "Recorded ${leg.from} → ${leg.to}.",
                 noticeIsError = false
             )
         }
-        saveSurvey(legs)
+        saveSurvey()
     }
 
-    private fun saveSurvey(legs: List<SurveyLeg>) {
+    /** Writes the survey as it is now; saves run in order on [surveyDispatcher]. */
+    private fun saveSurvey() {
         val uri = surveyUri ?: return
+        lrudSaveJob?.cancel()
+        val data = _uiState.value.survey.toData()
         viewModelScope.launch {
             try {
-                withContext(surveyDispatcher) { surveyStorage.save(uri, legs) }
+                withContext(surveyDispatcher) { surveyStorage.save(uri, data) }
             } catch (e: Exception) {
                 surveyNotice("Could not write survey file: ${e.message}", isError = true)
             }
         }
     }
 
+    /** Saves typed LRUD and station changes once typing pauses, not on every key. */
+    private fun scheduleLrudSave() {
+        lrudSaveJob?.cancel()
+        lrudSaveJob = viewModelScope.launch {
+            delay(1000)
+            saveSurvey()
+        }
+    }
+
+    /** Sets the LRUD boxes and keeps the stored LRUD for the At station in step with them. */
+    private fun SurveyState.withLrud(lrud: Map<LrudSide, String>): SurveyState {
+        val values = lrud.parseLrud()
+        val stations = when {
+            atStation.isBlank() -> stationLrud
+            values.isEmpty() -> stationLrud - atStation
+            else -> stationLrud + (atStation to StationLrud(atStation, values, now()))
+        }
+        return copy(lrud = lrud, stationLrud = stations)
+    }
+
+    private fun Map<LrudSide, String>.parseLrud(): Map<LrudSide, Double> =
+        mapNotNull { (side, text) -> text.toDoubleOrNull()?.let { side to it } }.toMap()
+
+    private fun Map<LrudSide, Double>?.toLrudText(): Map<LrudSide, String> =
+        this?.mapValues { (_, metres) -> formatMetres(metres) } ?: emptyMap()
+
+    private fun now() = LocalDateTime.now().truncatedTo(ChronoUnit.SECONDS).toString()
+
     private fun initialTarget(lrudBeforeLeg: Boolean) =
         if (lrudBeforeLeg) ShotTarget.LEFT else ShotTarget.LEG
+
+    /** L -> R -> U -> D -> leg, the order LRUD shots are taken in. */
+    private fun nextTarget(target: ShotTarget) =
+        if (target == ShotTarget.DOWN) ShotTarget.LEG else ShotTarget.entries[target.ordinal + 1]
+
+    /** Voice-entered LRUD; the value is spoken in millimetres. */
+    private fun setLrudFromVoice(side: LrudSide, millimetres: Int) {
+        if (!_uiState.value.survey.isOpen) {
+            toast("Voice: ${side.label} ignored, no survey open")
+            return
+        }
+        updateSurvey {
+            it.withLrud(it.lrud + (side to formatMetres(millimetres / 1000.0))).copy(
+                // Keep shot target in step, as if this side had been shot with the laser
+                target = if (it.target.side == side) nextTarget(it.target) else it.target
+            )
+        }
+        saveSurvey()
+        toast("Voice: ${side.label} $millimetres mm")
+        // D wraps round to L
+        _lrudFocusRequests.tryEmit(LrudSide.entries[(side.ordinal + 1) % LrudSide.entries.size])
+    }
 
     private fun formatMetres(metres: Double) = "%.2f".format(Locale.US, metres)
 
@@ -462,6 +600,20 @@ class YacsiViewModel(application: Application) : AndroidViewModel(application) {
 
     fun clearInfo() {
         _uiState.update { it.copy(infoMessage = null) }
+    }
+
+    /** Loads the voice model on first use, then toggles listening on and off. */
+    fun toggleVoiceControl() {
+        val voice = _uiState.value.voiceState
+        when {
+            voice.isListening -> voiceCommandManager.stopListening()
+            voice.isInitialized -> voiceCommandManager.startListening()
+            else -> voiceCommandManager.initialize()
+        }
+    }
+
+    private fun toast(message: String) {
+        _toasts.trySend(message)
     }
 
     private fun sendCommand(command: String, description: String): Boolean {
@@ -621,6 +773,7 @@ class YacsiViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     override fun onCleared() {
+        voiceCommandManager.destroy()
         super.onCleared()
         bluetoothService.disconnect()
     }

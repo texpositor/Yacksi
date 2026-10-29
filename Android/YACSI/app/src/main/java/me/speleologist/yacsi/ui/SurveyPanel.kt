@@ -4,12 +4,15 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -18,7 +21,10 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.emptyFlow
 import me.speleologist.yacsi.survey.LrudSide
+import me.speleologist.yacsi.survey.StationLrud
 import me.speleologist.yacsi.survey.SurveyLeg
 import me.speleologist.yacsi.viewmodel.ShotTarget
 import me.speleologist.yacsi.viewmodel.SurveyState
@@ -26,17 +32,34 @@ import me.speleologist.yacsi.viewmodel.SurveyState
 @Composable
 fun SurveyPanel(
     state: SurveyState,
+    canTakeReading: Boolean,
+    onTakeReading: () -> Unit,
     onNewSurvey: () -> Unit,
     onOpenSurvey: () -> Unit,
-    onFromChange: (String) -> Unit,
+    onAtChange: (String) -> Unit,
     onToChange: (String) -> Unit,
     onLrudChange: (LrudSide, String) -> Unit,
     onTargetChange: (ShotTarget) -> Unit,
-    onLrudBeforeLegChange: (Boolean) -> Unit,
     onUndoLastLeg: () -> Unit,
+    lrudFocusRequests: Flow<LrudSide> = emptyFlow(),
     modifier: Modifier = Modifier
 ) {
     var showUndoConfirm by remember { mutableStateOf(false) }
+    val listState = rememberLazyListState()
+    val lrudFocus = remember { LrudSide.entries.associateWith { FocusRequester() } }
+
+    // Move to the next LRUD field after one is filled by voice
+    LaunchedEffect(lrudFocusRequests) {
+        lrudFocusRequests.collect { side ->
+            // The controls are item 1; bring them back if they have scrolled away
+            if (listState.layoutInfo.visibleItemsInfo.none { it.index == 1 }) {
+                listState.scrollToItem(1)
+                withFrameNanos { }
+            }
+            // Not attached when no survey is open
+            runCatching { lrudFocus.getValue(side).requestFocus() }
+        }
+    }
 
     if (showUndoConfirm) {
         val leg = state.legs.lastOrNull()
@@ -60,29 +83,67 @@ fun SurveyPanel(
         )
     }
 
-    Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                text = state.fileName ?: "No survey open",
-                style = MaterialTheme.typography.titleSmall,
-                fontWeight = FontWeight.Bold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f)
-            )
-            TextButton(onClick = onNewSurvey) { Text("New") }
-            TextButton(onClick = onOpenSurvey) { Text("Open") }
+    // Controls and legs share one LazyColumn so the whole tab scrolls together
+    LazyColumn(state = listState, modifier = modifier) {
+        item {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = state.fileName ?: "No survey open",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
+                TextButton(onClick = onNewSurvey) { Text("New") }
+                TextButton(onClick = onOpenSurvey) { Text("Open") }
+            }
         }
 
         if (!state.isOpen) {
-            Text(
-                "Start a new survey file or open an existing one to record legs.",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.outline
-            )
-            return@Column
+            item {
+                Text(
+                    "Start a new survey file or open an existing one to record legs.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.outline
+                )
+            }
+            return@LazyColumn
         }
 
+        item {
+            SurveyControls(
+                state = state,
+                canTakeReading = canTakeReading,
+                onTakeReading = onTakeReading,
+                onAtChange = onAtChange,
+                onToChange = onToChange,
+                onLrudChange = onLrudChange,
+                onTargetChange = onTargetChange,
+                onUndoLeg = { showUndoConfirm = true },
+                lrudFocus = lrudFocus
+            )
+        }
+
+        // LRUD waiting at stations with no leg from them yet, e.g. passage ends
+        items(state.stationLrud.values.toList()) { station -> StationLrudRow(station) }
+        items(state.legs.asReversed()) { leg -> LegRow(leg) }
+    }
+}
+
+@Composable
+private fun SurveyControls(
+    state: SurveyState,
+    canTakeReading: Boolean,
+    onTakeReading: () -> Unit,
+    onAtChange: (String) -> Unit,
+    onToChange: (String) -> Unit,
+    onLrudChange: (LrudSide, String) -> Unit,
+    onTargetChange: (ShotTarget) -> Unit,
+    onUndoLeg: () -> Unit,
+    lrudFocus: Map<LrudSide, FocusRequester>
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         val stationKeyboard = KeyboardOptions(
             capitalization = KeyboardCapitalization.Characters,
             autoCorrectEnabled = false,
@@ -93,9 +154,9 @@ fun SurveyPanel(
             verticalAlignment = Alignment.CenterVertically
         ) {
             CompactTextField(
-                value = state.fromStation,
-                onValueChange = onFromChange,
-                label = "From",
+                value = state.atStation,
+                onValueChange = onAtChange,
+                label = "At",
                 keyboardOptions = stationKeyboard,
                 modifier = Modifier.weight(1f)
             )
@@ -107,19 +168,34 @@ fun SurveyPanel(
                 keyboardOptions = stationKeyboard,
                 modifier = Modifier.weight(1f)
             )
+            // Readings are normally taken with the device button, so this stays small
+            FilledTonalButton(
+                onClick = onTakeReading,
+                enabled = canTakeReading,
+                contentPadding = PaddingValues(horizontal = 12.dp)
+            ) {
+                Text("Read")
+            }
         }
 
         Row(
             horizontalArrangement = Arrangement.spacedBy(6.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text("Shot", style = MaterialTheme.typography.bodySmall)
             ShotTarget.entries.forEach { target ->
                 FilterChip(
                     selected = state.target == target,
                     onClick = { onTargetChange(target) },
                     label = { Text(target.label) }
                 )
+            }
+            Spacer(modifier = Modifier.weight(1f))
+            TextButton(
+                onClick = onUndoLeg,
+                enabled = state.legs.isNotEmpty(),
+                contentPadding = PaddingValues(horizontal = 8.dp)
+            ) {
+                Text("Undo Leg")
             }
         }
 
@@ -133,20 +209,8 @@ fun SurveyPanel(
                     onValueChange = { onLrudChange(side, it) },
                     label = side.label,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                    modifier = Modifier.weight(1f)
+                    modifier = Modifier.weight(1f).focusRequester(lrudFocus.getValue(side))
                 )
-            }
-        }
-
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Checkbox(checked = state.lrudBeforeLeg, onCheckedChange = onLrudBeforeLegChange)
-            Text(
-                "Shoot L, R, U, D before each leg",
-                style = MaterialTheme.typography.bodySmall,
-                modifier = Modifier.weight(1f)
-            )
-            TextButton(onClick = { showUndoConfirm = true }, enabled = state.legs.isNotEmpty()) {
-                Text("Undo Leg")
             }
         }
 
@@ -160,13 +224,10 @@ fun SurveyPanel(
 
         HorizontalDivider()
         Text(
-            "${state.legs.size} legs  (distance m, bearing °, inclination °, L R U D at From)",
+            "${state.legs.size} legs  (distance m, bearing °, inclination °, L R U D at the At station)",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.outline
         )
-        LazyColumn(modifier = Modifier.fillMaxWidth().weight(1f)) {
-            items(state.legs.asReversed()) { leg -> LegRow(leg) }
-        }
     }
 }
 
@@ -217,14 +278,27 @@ private fun CompactTextField(
     }
 }
 
+private fun formatLrudColumns(lrud: Map<LrudSide, Double>) = LrudSide.entries.joinToString(" ") { side ->
+    lrud[side]?.let { "%.2f".format(it) } ?: "-"
+}
+
+@Composable
+private fun StationLrudRow(station: StationLrud) {
+    Text(
+        text = "%-6s %-19s  %s".format(station.station, "(station)", formatLrudColumns(station.lrud)),
+        fontFamily = FontFamily.Monospace,
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.outline,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis
+    )
+}
+
 @Composable
 private fun LegRow(leg: SurveyLeg) {
-    val lrud = LrudSide.entries.joinToString(" ") { side ->
-        leg.lrud[side]?.let { "%.2f".format(it) } ?: "-"
-    }
     Text(
         text = "%-6s %-6s %7.2f %5.1f %5.1f  %s".format(
-            leg.from, leg.to, leg.distanceM, leg.bearing, leg.inclination, lrud
+            leg.from, leg.to, leg.distanceM, leg.bearing, leg.inclination, formatLrudColumns(leg.lrud)
         ),
         fontFamily = FontFamily.Monospace,
         style = MaterialTheme.typography.bodySmall,

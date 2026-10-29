@@ -1,21 +1,36 @@
 package me.speleologist.yacsi.ui
 
+import android.widget.Toast
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.BluetoothConnected
+import androidx.compose.material.icons.filled.BluetoothDisabled
+import androidx.compose.material.icons.automirrored.filled.BluetoothSearching
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -24,6 +39,7 @@ import androidx.compose.ui.unit.sp
 import me.speleologist.yacsi.bluetooth.ConnectionState
 import me.speleologist.yacsi.viewmodel.AppMode
 import me.speleologist.yacsi.viewmodel.YacsiViewModel
+import kotlinx.coroutines.flow.filter
 import java.time.LocalDate
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -40,6 +56,22 @@ fun MainScreen(
     var showDistanceOffsetDialog by remember { mutableStateOf(false) }
 
     var selectedTab by rememberSaveable { mutableIntStateOf(0) }
+    var isTouchLocked by rememberSaveable { mutableStateOf(false) }
+    val isTouchLockedState = rememberUpdatedState(isTouchLocked)
+    val focusManager = LocalFocusManager.current
+    val context = LocalContext.current
+
+    // Swallow Back while locked so a stray swipe doesn't leave the app
+    BackHandler(enabled = isTouchLocked) {}
+
+    // Show view model status messages as toasts, replacing any still on screen
+    LaunchedEffect(Unit) {
+        var toast: Toast? = null
+        viewModel.toasts.collect { message ->
+            toast?.cancel()
+            toast = Toast.makeText(context, message, Toast.LENGTH_SHORT).also { it.show() }
+        }
+    }
 
     val listState = rememberLazyListState()
     val clipboardManager = LocalClipboardManager.current
@@ -154,375 +186,454 @@ fun MainScreen(
         )
     }
 
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = {
-                    Column {
-                        Text("YACSI - Cave Survey")
-                        val statusText = when (uiState.connectionState) {
-                            ConnectionState.CONNECTED -> "Connected to ${uiState.connectedDeviceName ?: "Yacksi"}"
-                            ConnectionState.CONNECTING -> "Connecting to ${uiState.connectedDeviceName ?: "Yacksi"}…"
-                            ConnectionState.DISCONNECTED -> {
-                                if (uiState.isAutoReconnectEnabled) {
-                                    "Auto-reconnecting to ${uiState.connectedDeviceName ?: "Yacksi"}…"
-                                } else {
-                                    "Disconnected"
-                                }
-                            }
-                        }
-                        val statusColor = when {
-                            uiState.connectionState == ConnectionState.CONNECTED -> MaterialTheme.colorScheme.primary
-                            uiState.connectionState == ConnectionState.CONNECTING || uiState.isAutoReconnectEnabled -> MaterialTheme.colorScheme.secondary
-                            else -> MaterialTheme.colorScheme.error
-                        }
+    val isConnected = uiState.connectionState == ConnectionState.CONNECTED
+    val isConnecting = uiState.connectionState == ConnectionState.CONNECTING
+    val isAutoConnecting = uiState.connectionState == ConnectionState.DISCONNECTED && uiState.isAutoReconnectEnabled
+    val deviceMenuEnabled = isConnected && uiState.appMode == AppMode.NORMAL
+
+    Box(modifier = Modifier.fillMaxSize()) {
+        Scaffold(
+            topBar = {
+                TopAppBar(
+                    expandedHeight = 48.dp,
+                    title = {
+                        // Tapping the title is a quick way to lock the touch screen
                         Text(
-                            text = statusText,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = statusColor
+                            "YACSI",
+                            style = MaterialTheme.typography.titleMedium,
+                            modifier = Modifier
+                                .clickable(onClickLabel = "Lock touch screen") {
+                                    focusManager.clearFocus()
+                                    isTouchLocked = true
+                                }
+                                .padding(vertical = 8.dp, horizontal = 4.dp)
                         )
-                    }
-                },
-                actions = {
-                    // Connect / Disconnect button
-                    val isConnected = uiState.connectionState == ConnectionState.CONNECTED
-                    val isConnecting = uiState.connectionState == ConnectionState.CONNECTING
-                    val isAutoConnecting = uiState.connectionState == ConnectionState.DISCONNECTED && uiState.isAutoReconnectEnabled
-                    val isActiveState = isConnected || isConnecting || isAutoConnecting
-
-                    Button(
-                        onClick = {
-                            if (isActiveState) {
-                                viewModel.disconnect()
-                            } else {
-                                onRequestPermissions()
-                                showDeviceDialog = true
-                            }
-                        },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = if (isConnected) MaterialTheme.colorScheme.errorContainer
-                            else if (isConnecting || isAutoConnecting) MaterialTheme.colorScheme.secondaryContainer
-                            else MaterialTheme.colorScheme.primary
-                        ),
-                        modifier = Modifier.padding(end = 8.dp)
-                    ) {
-                        Text(
-                            text = when {
-                                isConnected -> "Disconnect"
-                                isConnecting || isAutoConnecting -> "Cancel"
-                                else -> "Connect"
-                            },
-                            color = when {
-                                isConnected -> MaterialTheme.colorScheme.onErrorContainer
-                                isConnecting || isAutoConnecting -> MaterialTheme.colorScheme.onSecondaryContainer
-                                else -> MaterialTheme.colorScheme.onPrimary
-                            }
-                        )
-                    }
-
-                    // Overflow Menu
-                    Box {
-                        IconButton(
-                            onClick = { showMenu = true },
-                            enabled = isConnected && uiState.appMode == AppMode.NORMAL
-                        ) {
-                            Icon(Icons.Default.MoreVert, contentDescription = "Menu")
-                        }
-                        DropdownMenu(
-                            expanded = showMenu,
-                            onDismissRequest = { showMenu = false }
-                        ) {
-                            DropdownMenuItem(
-                                text = { Text("Distance Offset") },
-                                onClick = {
-                                    showMenu = false
-                                    viewModel.requestDistanceOffset()
-                                    showDistanceOffsetDialog = true
-                                }
-                            )
-                            HorizontalDivider()
-                            DropdownMenuItem(
-                                text = { Text("Shot Calibration") },
-                                onClick = {
-                                    showMenu = false
-                                    viewModel.startShotCalibration()
-                                }
-                            )
-                            DropdownMenuItem(
-                                text = { Text("Refit Stored Shots") },
-                                onClick = {
-                                    showMenu = false
-                                    viewModel.refitStoredShots()
-                                }
-                            )
-                            DropdownMenuItem(
-                                text = { Text("Show Calibration Data") },
-                                onClick = {
-                                    showMenu = false
-                                    viewModel.dumpShotCalibration()
-                                }
-                            )
-                            DropdownMenuItem(
-                                text = { Text("Erase Shot Calibration") },
-                                onClick = {
-                                    showMenu = false
-                                    showEraseShotConfirmDialog = true
-                                }
-                            )
-                            HorizontalDivider()
-                            DropdownMenuItem(
-                                text = { Text("Rough Accelerometer Calibration") },
-                                onClick = {
-                                    showMenu = false
-                                    viewModel.startAccelCalibration()
-                                }
-                            )
-                            DropdownMenuItem(
-                                text = { Text("Rough Magnetometer Calibration") },
-                                onClick = {
-                                    showMenu = false
-                                    viewModel.startMagCalibration()
-                                }
-                            )
-                            DropdownMenuItem(
-                                text = { Text("Erase Magnetometer Calibration") },
-                                onClick = {
-                                    showMenu = false
-                                    showEraseConfirmDialog = true
-                                }
-                            )
-                        }
-                    }
-                }
-            )
-        }
-    ) { innerPadding ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(innerPadding)
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            // Mode Banner / Calibration Controls if in calibration mode
-            if (uiState.appMode == AppMode.SHOT_CALIBRATION) {
-                ShotCalibrationCard(
-                    state = uiState.shotCalibration,
-                    onTakeShot = { viewModel.takeCalibrationShot() },
-                    onUndo = { viewModel.undoCalibrationShot() },
-                    onFinishEarly = { viewModel.finishShotCalibrationEarly() },
-                    onAbort = { viewModel.abortShotCalibration() },
-                    onAccept = { viewModel.acceptShotCalibration() },
-                    onDiscard = { viewModel.discardShotCalibration() }
-                )
-            } else if (uiState.appMode != AppMode.NORMAL) {
-                Card(
-                    colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.tertiaryContainer
-                    ),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Column(modifier = Modifier.padding(16.dp)) {
-                        Text(
-                            text = when (uiState.appMode) {
-                                AppMode.ACCEL_CALIBRATION -> "Mode: Rough Accelerometer Calibration"
-                                else -> "Mode: Rough Magnetometer Calibration"
-                            },
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.onTertiaryContainer
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Text(
-                            text = when (uiState.appMode) {
-                                AppMode.ACCEL_CALIBRATION -> "Place device in requested orientation and press Continue."
-                                else -> "Rotate instrument through all orientations continuously until complete."
-                            },
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onTertiaryContainer
-                        )
-                        if (uiState.appMode == AppMode.ACCEL_CALIBRATION) {
-                            Spacer(modifier = Modifier.height(12.dp))
-                            Button(
-                                onClick = { viewModel.sendCalibrationContinue() },
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Text("Continue to Next Position")
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Parsed Data Display
-            val reading = uiState.latestReading
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
-            ) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Text(
-                        text = "Live Readings",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        MetricItem(
-                            label = "Distance",
-                            value = if (reading != null) "${reading.distMm.toInt()} mm" else "---",
-                            modifier = Modifier.weight(1f)
-                        )
-                        MetricItem(
-                            label = "Bearing",
-                            value = if (reading != null) {
-                                if (reading.bearing != null) "%.1f°".format(reading.bearing) else "nan"
-                            } else "---",
-                            modifier = Modifier.weight(1f)
-                        )
-                        MetricItem(
-                            label = "Inclination",
-                            value = if (reading != null) "%.1f°".format(reading.incl) else "---",
-                            modifier = Modifier.weight(1f)
-                        )
-                    }
-
-                    if (reading?.calibration != null) {
-                        Spacer(modifier = Modifier.height(4.dp))
-                        // Under the shot calibration the field magnitude is 1.0; a large
-                        // deviation suggests nearby iron or electrical interference.
-                        val interference = reading.calibration == "SHOT" &&
-                            reading.mLen != null && kotlin.math.abs(reading.mLen - 1f) > 0.05f
-                        Text(
-                            text = buildString {
-                                append(if (reading.calibration == "SHOT") "Shot calibration" else "Rough calibration only")
-                                reading.mLen?.let { append("  ·  field %.3f".format(it)) }
-                                reading.laserMm?.let { laserMm ->
-                                    val offsetMm = (reading.distMm - laserMm).toInt()
-                                    if (offsetMm != 0) append("  ·  distance offset %+d mm".format(offsetMm))
-                                }
-                                if (interference) append("  ·  possible magnetic interference")
-                            },
-                            style = MaterialTheme.typography.bodySmall,
-                            color = if (interference || reading.calibration != "SHOT") {
-                                MaterialTheme.colorScheme.error
-                            } else {
-                                MaterialTheme.colorScheme.outline
-                            }
-                        )
-                    }
-                }
-            }
-
-            // Take Reading Button
-            val isConnected = uiState.connectionState == ConnectionState.CONNECTED
-            Button(
-                onClick = { viewModel.takeReading() },
-                enabled = isConnected && uiState.appMode == AppMode.NORMAL,
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = MaterialTheme.colorScheme.primary
-                ),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(50.dp)
-            ) {
-                Text(
-                    text = "Take Reading (R)",
-                    style = MaterialTheme.typography.titleMedium
-                )
-            }
-
-            PrimaryTabRow(selectedTabIndex = selectedTab) {
-                Tab(selected = selectedTab == 0, onClick = { selectedTab = 0 }, text = { Text("Survey") })
-                Tab(selected = selectedTab == 1, onClick = { selectedTab = 1 }, text = { Text("Log") })
-            }
-
-            if (selectedTab == 0) {
-                SurveyPanel(
-                    state = uiState.survey,
-                    onNewSurvey = { newSurveyLauncher.launch("survey-${LocalDate.now()}.csv") },
-                    onOpenSurvey = {
-                        openSurveyLauncher.launch(arrayOf("text/*", "application/csv", "application/octet-stream"))
                     },
-                    onFromChange = viewModel::setFromStation,
-                    onToChange = viewModel::setToStation,
-                    onLrudChange = viewModel::setLrud,
-                    onTargetChange = viewModel::setShotTarget,
-                    onLrudBeforeLegChange = viewModel::setLrudBeforeLeg,
-                    onUndoLastLeg = viewModel::undoLastLeg,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f)
+                    actions = {
+                        if (uiState.voiceState.isListening) {
+                            Icon(
+                                imageVector = Icons.Default.Mic,
+                                contentDescription = "Voice control listening",
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.padding(horizontal = 4.dp)
+                            )
+                        }
+                        // Connection state at a glance; connect/disconnect is in the menu
+                        Icon(
+                            imageVector = when {
+                                isConnected -> Icons.Default.BluetoothConnected
+                                isConnecting || isAutoConnecting -> Icons.AutoMirrored.Filled.BluetoothSearching
+                                else -> Icons.Default.BluetoothDisabled
+                            },
+                            contentDescription = when {
+                                isConnected -> "Connected"
+                                isConnecting || isAutoConnecting -> "Connecting"
+                                else -> "Disconnected"
+                            },
+                            tint = when {
+                                isConnected -> MaterialTheme.colorScheme.primary
+                                isConnecting || isAutoConnecting -> MaterialTheme.colorScheme.secondary
+                                else -> MaterialTheme.colorScheme.error
+                            },
+                            modifier = Modifier.padding(horizontal = 4.dp)
+                        )
+
+                        // Overflow Menu
+                        Box {
+                            IconButton(onClick = { showMenu = true }) {
+                                Icon(Icons.Default.MoreVert, contentDescription = "Menu")
+                            }
+                            DropdownMenu(
+                                expanded = showMenu,
+                                onDismissRequest = { showMenu = false }
+                            ) {
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(
+                                            when {
+                                                isConnected -> "Disconnect"
+                                                isConnecting || isAutoConnecting -> "Cancel Connecting"
+                                                else -> "Connect…"
+                                            }
+                                        )
+                                    },
+                                    onClick = {
+                                        showMenu = false
+                                        if (isConnected || isConnecting || isAutoConnecting) {
+                                            viewModel.disconnect()
+                                        } else {
+                                            onRequestPermissions()
+                                            showDeviceDialog = true
+                                        }
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Voice Control") },
+                                    trailingIcon = {
+                                        if (uiState.voiceState.isListening) {
+                                            Icon(Icons.Default.Check, contentDescription = "On")
+                                        }
+                                    },
+                                    onClick = {
+                                        showMenu = false
+                                        viewModel.toggleVoiceControl()
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Lock Touch Screen") },
+                                    leadingIcon = { Icon(Icons.Default.Lock, contentDescription = null) },
+                                    onClick = {
+                                        showMenu = false
+                                        focusManager.clearFocus()
+                                        isTouchLocked = true
+                                    }
+                                )
+                                // What the device button shoots after a leg: L, R, U, D first, or the next leg
+                                DropdownMenuItem(
+                                    text = { Text("Shoot LRUD Before Each Leg") },
+                                    trailingIcon = {
+                                        if (uiState.survey.lrudBeforeLeg) {
+                                            Icon(Icons.Default.Check, contentDescription = "On")
+                                        }
+                                    },
+                                    onClick = {
+                                        showMenu = false
+                                        viewModel.setLrudBeforeLeg(!uiState.survey.lrudBeforeLeg)
+                                    }
+                                )
+                                HorizontalDivider()
+                                DropdownMenuItem(
+                                    text = { Text("Distance Offset") },
+                                    enabled = deviceMenuEnabled,
+                                    onClick = {
+                                        showMenu = false
+                                        viewModel.requestDistanceOffset()
+                                        showDistanceOffsetDialog = true
+                                    }
+                                )
+                                HorizontalDivider()
+                                DropdownMenuItem(
+                                    text = { Text("Shot Calibration") },
+                                    enabled = deviceMenuEnabled,
+                                    onClick = {
+                                        showMenu = false
+                                        viewModel.startShotCalibration()
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Refit Stored Shots") },
+                                    enabled = deviceMenuEnabled,
+                                    onClick = {
+                                        showMenu = false
+                                        viewModel.refitStoredShots()
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Show Calibration Data") },
+                                    enabled = deviceMenuEnabled,
+                                    onClick = {
+                                        showMenu = false
+                                        viewModel.dumpShotCalibration()
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Erase Shot Calibration") },
+                                    enabled = deviceMenuEnabled,
+                                    onClick = {
+                                        showMenu = false
+                                        showEraseShotConfirmDialog = true
+                                    }
+                                )
+                                HorizontalDivider()
+                                DropdownMenuItem(
+                                    text = { Text("Rough Accelerometer Calibration") },
+                                    enabled = deviceMenuEnabled,
+                                    onClick = {
+                                        showMenu = false
+                                        viewModel.startAccelCalibration()
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Rough Magnetometer Calibration") },
+                                    enabled = deviceMenuEnabled,
+                                    onClick = {
+                                        showMenu = false
+                                        viewModel.startMagCalibration()
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Erase Magnetometer Calibration") },
+                                    enabled = deviceMenuEnabled,
+                                    onClick = {
+                                        showMenu = false
+                                        showEraseConfirmDialog = true
+                                    }
+                                )
+                            }
+                        }
+                    }
                 )
-            } else {
-                // Scrolling Output Window (Monospace)
+            }
+        ) { innerPadding ->
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(innerPadding)
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                // Mode Banner / Calibration Controls if in calibration mode
+                if (uiState.appMode == AppMode.SHOT_CALIBRATION) {
+                    ShotCalibrationCard(
+                        state = uiState.shotCalibration,
+                        onTakeShot = { viewModel.takeCalibrationShot() },
+                        onUndo = { viewModel.undoCalibrationShot() },
+                        onFinishEarly = { viewModel.finishShotCalibrationEarly() },
+                        onAbort = { viewModel.abortShotCalibration() },
+                        onAccept = { viewModel.acceptShotCalibration() },
+                        onDiscard = { viewModel.discardShotCalibration() }
+                    )
+                } else if (uiState.appMode != AppMode.NORMAL) {
+                    Card(
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.tertiaryContainer
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            Text(
+                                text = when (uiState.appMode) {
+                                    AppMode.ACCEL_CALIBRATION -> "Mode: Rough Accelerometer Calibration"
+                                    else -> "Mode: Rough Magnetometer Calibration"
+                                },
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onTertiaryContainer
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = when (uiState.appMode) {
+                                    AppMode.ACCEL_CALIBRATION -> "Place device in requested orientation and press Continue."
+                                    else -> "Rotate instrument through all orientations continuously until complete."
+                                },
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onTertiaryContainer
+                            )
+                            if (uiState.appMode == AppMode.ACCEL_CALIBRATION) {
+                                Spacer(modifier = Modifier.height(12.dp))
+                                Button(
+                                    onClick = { viewModel.sendCalibrationContinue() },
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Text("Continue to Next Position")
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Parsed Data Display
+                val reading = uiState.latestReading
                 Card(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f),
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                    modifier = Modifier.fillMaxWidth(),
+                    elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
                 ) {
-                    Column(modifier = Modifier.fillMaxSize().padding(8.dp)) {
+                    Column(modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp)) {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
+                            horizontalArrangement = Arrangement.SpaceBetween
                         ) {
-                            Text(
-                                text = "Output Log",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            MetricItem(
+                                label = "Distance",
+                                value = if (reading != null) "${reading.distMm.toInt()} mm" else "---",
+                                modifier = Modifier.weight(1f)
                             )
-                            if (uiState.rawLogs.isNotEmpty()) {
-                                IconButton(
-                                    onClick = {
-                                        clipboardManager.setText(AnnotatedString(uiState.rawLogs.joinToString("\n")))
-                                    },
-                                    modifier = Modifier.size(24.dp)
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.ContentCopy,
-                                        contentDescription = "Copy Output Log",
-                                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        modifier = Modifier.size(16.dp)
-                                    )
+                            MetricItem(
+                                label = "Bearing",
+                                value = if (reading != null) {
+                                    if (reading.bearing != null) "%.1f°".format(reading.bearing) else "nan"
+                                } else "---",
+                                modifier = Modifier.weight(1f)
+                            )
+                            MetricItem(
+                                label = "Inclination",
+                                value = if (reading != null) "%.1f°".format(reading.incl) else "---",
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+
+                        if (reading?.calibration != null) {
+                            Spacer(modifier = Modifier.height(2.dp))
+                            // Under the shot calibration the field magnitude is 1.0; a large
+                            // deviation suggests nearby iron or electrical interference.
+                            val interference = reading.calibration == "SHOT" &&
+                                reading.mLen != null && kotlin.math.abs(reading.mLen - 1f) > 0.05f
+                            Text(
+                                text = buildString {
+                                    append(if (reading.calibration == "SHOT") "Shot calibration" else "Rough calibration only")
+                                    reading.mLen?.let { append("  ·  field %.3f".format(it)) }
+                                    reading.laserMm?.let { laserMm ->
+                                        val offsetMm = (reading.distMm - laserMm).toInt()
+                                        if (offsetMm != 0) append("  ·  distance offset %+d mm".format(offsetMm))
+                                    }
+                                    if (interference) append("  ·  possible magnetic interference")
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (interference || reading.calibration != "SHOT") {
+                                    MaterialTheme.colorScheme.error
+                                } else {
+                                    MaterialTheme.colorScheme.outline
+                                }
+                            )
+                        }
+                    }
+                }
+
+                PrimaryTabRow(selectedTabIndex = selectedTab) {
+                    // Content overload so the tabs can be shorter than the default 48dp
+                    Tab(selected = selectedTab == 0, onClick = { selectedTab = 0 }, modifier = Modifier.height(36.dp)) { Text("Survey") }
+                    Tab(selected = selectedTab == 1, onClick = { selectedTab = 1 }, modifier = Modifier.height(36.dp)) { Text("Log") }
+                }
+
+                if (selectedTab == 0) {
+                    SurveyPanel(
+                        state = uiState.survey,
+                        canTakeReading = deviceMenuEnabled,
+                        onTakeReading = viewModel::takeReading,
+                        onNewSurvey = { newSurveyLauncher.launch("survey-${LocalDate.now()}.csv") },
+                        onOpenSurvey = {
+                            openSurveyLauncher.launch(arrayOf("text/*", "application/csv", "application/octet-stream"))
+                        },
+                        onAtChange = viewModel::setAtStation,
+                        onToChange = viewModel::setToStation,
+                        onLrudChange = viewModel::setLrud,
+                        onTargetChange = viewModel::setShotTarget,
+                        onUndoLastLeg = viewModel::undoLastLeg,
+                        // No focus (and so no keyboard) while the touch screen is locked
+                        lrudFocusRequests = remember { viewModel.lrudFocusRequests.filter { !isTouchLockedState.value } },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f)
+                    )
+                } else {
+                    // Scrolling Output Window (Monospace)
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                    ) {
+                        Column(modifier = Modifier.fillMaxSize().padding(8.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "Output Log",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                TextButton(onClick = { viewModel.takeReading() }, enabled = deviceMenuEnabled) {
+                                    Text("Take Reading")
+                                }
+                                if (uiState.rawLogs.isNotEmpty()) {
+                                    IconButton(
+                                        onClick = {
+                                            clipboardManager.setText(AnnotatedString(uiState.rawLogs.joinToString("\n")))
+                                        },
+                                        modifier = Modifier.size(24.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.ContentCopy,
+                                            contentDescription = "Copy Output Log",
+                                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                    }
                                 }
                             }
-                        }
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Box(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .background(MaterialTheme.colorScheme.surface)
-                                .padding(8.dp)
-                        ) {
-                            if (uiState.rawLogs.isEmpty()) {
-                                Text(
-                                    text = "Connected output will appear here...",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.outline,
-                                    modifier = Modifier.align(Alignment.Center)
-                                )
-                            } else {
-                                LazyColumn(
-                                    state = listState,
-                                    modifier = Modifier.fillMaxSize()
-                                ) {
-                                    items(uiState.rawLogs) { logLine ->
-                                        Text(
-                                            text = logLine,
-                                            fontFamily = FontFamily.Monospace,
-                                            fontSize = 12.sp,
-                                            color = MaterialTheme.colorScheme.onSurface
-                                        )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .background(MaterialTheme.colorScheme.surface)
+                                    .padding(8.dp)
+                            ) {
+                                if (uiState.rawLogs.isEmpty()) {
+                                    Text(
+                                        text = "Connected output will appear here...",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.outline,
+                                        modifier = Modifier.align(Alignment.Center)
+                                    )
+                                } else {
+                                    LazyColumn(
+                                        state = listState,
+                                        modifier = Modifier.fillMaxSize()
+                                    ) {
+                                        items(uiState.rawLogs) { logLine ->
+                                            Text(
+                                                text = logLine,
+                                                fontFamily = FontFamily.Monospace,
+                                                fontSize = 12.sp,
+                                                color = MaterialTheme.colorScheme.onSurface
+                                            )
+                                        }
                                     }
                                 }
                             }
                         }
                     }
                 }
+            }
+        }
+
+        if (isTouchLocked) {
+            TouchLockOverlay(onUnlock = { isTouchLocked = false })
+        }
+    }
+}
+
+@Composable
+private fun TouchLockOverlay(onUnlock: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.2f))
+            // Being the topmost hit target is enough to keep touches from the content
+            // underneath; nothing is consumed so the unlock button's long press still works
+            .pointerInput(Unit) {
+                awaitPointerEventScope {
+                    while (true) awaitPointerEvent()
+                }
+            }
+    ) {
+        Surface(
+            shape = RoundedCornerShape(28.dp),
+            color = MaterialTheme.colorScheme.primaryContainer,
+            shadowElevation = 4.dp,
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .navigationBarsPadding()
+                .padding(24.dp)
+                .pointerInput(Unit) { detectTapGestures(onLongPress = { onUnlock() }) }
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.padding(horizontal = 24.dp, vertical = 16.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Lock,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onPrimaryContainer
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    "Hold to unlock",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer
+                )
             }
         }
     }
@@ -536,7 +647,6 @@ fun MetricItem(label: String, value: String, modifier: Modifier = Modifier) {
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.outline
         )
-        Spacer(modifier = Modifier.height(2.dp))
         Text(
             text = value,
             style = MaterialTheme.typography.titleLarge,

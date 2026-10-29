@@ -10,17 +10,13 @@ import androidx.core.content.ContextCompat
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import org.json.JSONArray
 import org.json.JSONObject
 import org.vosk.Model
 import org.vosk.Recognizer
 import org.vosk.android.RecognitionListener
 import org.vosk.android.SpeechService
 import org.vosk.android.StorageService
-
-enum class VoiceAction {
-    SET_TARGET_LEG,
-    SET_TARGET_SECTION
-}
 
 data class VoiceState(
     val isInitialized: Boolean = false,
@@ -64,7 +60,7 @@ class VoiceCommandManager(private val context: Context) : RecognitionListener {
             model = loadedModel
             _state.value = _state.value.copy(
                 isInitialized = true,
-                statusMessage = "Voice active: 'yak see leg' / 'yak see section'"
+                statusMessage = "Voice active: 'yak see leg / section / left 1234'"
             )
             startListening()
         }, { exception ->
@@ -80,8 +76,8 @@ class VoiceCommandManager(private val context: Context) : RecognitionListener {
         if (speechService != null) return
 
         try {
-            // Grammar restricting recognizer to "yak", "see", "leg", "section", and unknown
-            val grammar = "[\"yak\", \"see\", \"leg\", \"section\", \"[unk]\"]"
+            // Restrict the recogniser to the command and number words, plus unknown
+            val grammar = JSONArray(VOICE_GRAMMAR_WORDS + "[unk]").toString()
             val recognizer = Recognizer(loadedModel, 16000.0f, grammar)
 
             speechService = SpeechService(recognizer, 16000.0f).apply {
@@ -89,7 +85,7 @@ class VoiceCommandManager(private val context: Context) : RecognitionListener {
             }
             _state.value = _state.value.copy(
                 isListening = true,
-                statusMessage = "Listening for 'yak see leg' / 'yak see section'..."
+                statusMessage = "Listening for 'yak see leg / section / left 1234'..."
             )
         } catch (e: Exception) {
             Log.e("VoiceCommandManager", "Failed to start speech service", e)
@@ -146,24 +142,20 @@ class VoiceCommandManager(private val context: Context) : RecognitionListener {
 
             _state.value = _state.value.copy(lastRecognizedText = text)
 
-            // Check for trigger phrase matching
-            if (text.contains("leg")) {
-                _state.value = _state.value.copy(
-                    lastAction = VoiceAction.SET_TARGET_LEG,
-                    statusMessage = "Recognized: 'yak see leg'"
-                )
-                // Single beep for leg
-                toneGenerator?.startTone(ToneGenerator.TONE_PROP_BEEP, 200)
-                onCommandRecognized?.invoke(VoiceAction.SET_TARGET_LEG)
-            } else if (text.contains("section")) {
-                _state.value = _state.value.copy(
-                    lastAction = VoiceAction.SET_TARGET_SECTION,
-                    statusMessage = "Recognized: 'yak see section'"
-                )
-                // Double beep for section
-                toneGenerator?.startTone(ToneGenerator.TONE_PROP_BEEP2, 400)
-                onCommandRecognized?.invoke(VoiceAction.SET_TARGET_SECTION)
+            val action = parseVoiceCommand(text) ?: return
+            // statusMessage is left alone; the caller announces recognised commands
+            _state.value = _state.value.copy(lastAction = action)
+            when (action) {
+                // Single beep for leg and for an LRUD value, double beep for section
+                VoiceAction.SetTargetLeg, is VoiceAction.SetLrud ->
+                    toneGenerator?.startTone(ToneGenerator.TONE_PROP_BEEP, 200)
+                VoiceAction.SetTargetSection ->
+                    toneGenerator?.startTone(ToneGenerator.TONE_PROP_BEEP2, 400)
+                // Error tone: a side was heard but the number wasn't
+                is VoiceAction.MissingNumber ->
+                    toneGenerator?.startTone(ToneGenerator.TONE_PROP_NACK, 400)
             }
+            onCommandRecognized?.invoke(action)
         } catch (e: Exception) {
             Log.e("VoiceCommandManager", "Error parsing result JSON", e)
         }

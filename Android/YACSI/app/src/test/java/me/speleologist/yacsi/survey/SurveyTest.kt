@@ -52,6 +52,31 @@ class SurveyTest {
                 "LB2,LB3,3.000,0.0,45.0,,,,,\n",
             text
         )
-        assertEquals(legs, SurveyCsv.parse(text))
+        assertEquals(SurveyData(legs), SurveyCsv.parse(text))
+    }
+
+    @Test
+    fun csv_roundTripsStationLrud() {
+        val data = SurveyData(
+            legs = listOf(SurveyLeg("LB1", "LB2", 3.0, 0.0, 45.0)),
+            stationLrud = listOf(
+                StationLrud("LB2", mapOf(LrudSide.LEFT to 0.8, LrudSide.UP to 2.0), "2026-10-27T10:00:00")
+            )
+        )
+        val text = SurveyCsv.format(data)
+        assertEquals(
+            SurveyCsv.HEADER + "\n" +
+                "LB1,LB2,3.000,0.0,45.0,,,,,\n" +
+                "LB2,,,,,0.80,,2.00,,2026-10-27T10:00:00\n",
+            text
+        )
+        assertEquals(data, SurveyCsv.parse(text))
+    }
+
+    @Test
+    fun csv_readsFilesWithoutStationRows() {
+        val text = SurveyCsv.HEADER + "\nLB1,LB2,3.000,0.0,45.0,,,,,\n"
+        assertEquals(emptyList<StationLrud>(), SurveyCsv.parse(text).stationLrud)
+        assertEquals(1, SurveyCsv.parse(text).legs.size)
     }
 }
