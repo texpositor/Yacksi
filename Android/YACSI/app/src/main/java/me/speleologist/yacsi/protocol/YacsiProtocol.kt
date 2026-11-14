@@ -52,13 +52,46 @@ data class DistanceOffsetMessage(val offsetMm: Int, val status: String)
 
 fun parseDistanceOffsetLine(line: String): DistanceOffsetMessage? {
     if (!line.startsWith("DIST_OFFSET_MM=")) return null
-    val fields = line.split(",").mapNotNull { part ->
-        val kv = part.split("=", limit = 2)
-        if (kv.size == 2) kv[0].trim() to kv[1].trim() else null
-    }.toMap()
+    val fields = parseFields(line)
     val offset = fields["DIST_OFFSET_MM"]?.toIntOrNull() ?: return null
     return DistanceOffsetMessage(offset, fields["STATUS"] ?: "CURRENT")
 }
+
+/**
+ * Battery status line the device sends before every reading:
+ * `BATTERY_MV=<mV>,STATUS=OK|LOW|NONE` where NONE means no battery is
+ * connected (the device is running from USB).
+ */
+data class BatteryMessage(val millivolts: Int, val status: String) {
+    val isLow: Boolean get() = status == "LOW"
+}
+
+fun parseBatteryLine(line: String): BatteryMessage? {
+    if (!line.startsWith("BATTERY_MV=")) return null
+    val fields = parseFields(line)
+    val millivolts = fields["BATTERY_MV"]?.toIntOrNull() ?: return null
+    return BatteryMessage(millivolts, fields["STATUS"] ?: "OK")
+}
+
+/**
+ * Rough accelerometer calibration prompt from the device:
+ * `Position <n>/<total>: <orientation>`, e.g. `Position 1/6: X axis pointing up`
+ */
+data class AccelPositionMessage(val position: Int, val total: Int, val orientation: String)
+
+private val accelPositionPattern = Regex("""Position (\d+)/(\d+): (.+)""")
+
+fun parseAccelPositionLine(line: String): AccelPositionMessage? {
+    val match = accelPositionPattern.matchEntire(line.trim()) ?: return null
+    val (position, total, orientation) = match.destructured
+    return AccelPositionMessage(position.toInt(), total.toInt(), orientation.trim())
+}
+
+private fun parseFields(line: String): Map<String, String> =
+    line.split(",").mapNotNull { part ->
+        val kv = part.split("=", limit = 2)
+        if (kv.size == 2) kv[0].trim() to kv[1].trim() else null
+    }.toMap()
 
 fun parseYacsiLine(line: String): YacsiReading? {
     if (!line.contains("DIST_MM=")) return null

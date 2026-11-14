@@ -10,6 +10,14 @@
 // Momentary push button to GND (internal pull-up) and passive piezo buzzer.
 #define BUTTON_PIN 27
 #define BUZZER_PIN 26
+// Two Li-ion cells in series (6.0 V empty, 8.4 V full) through a 100k/33k
+// divider to an ADC1 pin (ADC2 is unavailable while Bluetooth is running).
+// 8.4 V gives 2.08 V at the pin, inside the 11 dB attenuation range. A 100 nF
+// capacitor across the 33k steadies the reading.
+#define BATTERY_PIN 34
+#define BATTERY_DIVIDER_RATIO ((100.0f + 33.0f) / 33.0f)
+#define BATTERY_LOW_MV 6800      // 3.4 V per cell
+#define BATTERY_PRESENT_MV 3000  // below this no battery is connected (USB power)
 
 #define SPI_SCK 18
 #define SPI_MISO 19
@@ -127,6 +135,11 @@ enum class Sound : uint8_t {
 };
 void initBuzzer();
 void playSound(Sound sound);
+
+void initBatteryMonitor();
+uint32_t readBatteryMillivolts();
+// Sends a BATTERY_MV=... status line and returns true if the battery is low.
+bool reportBattery();
 
 void adxl355_writeRegister(uint8_t reg, uint8_t value);
 uint8_t adxl355_readRegister(uint8_t reg);

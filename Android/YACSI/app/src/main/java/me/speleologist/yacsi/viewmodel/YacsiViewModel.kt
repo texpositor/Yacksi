@@ -2,7 +2,10 @@ package me.speleologist.yacsi.viewmodel
 
 import android.app.Application
 import android.bluetooth.BluetoothDevice
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.net.Uri
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
@@ -25,9 +28,12 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import me.speleologist.yacsi.bluetooth.BluetoothService
 import me.speleologist.yacsi.bluetooth.ConnectionState
+import me.speleologist.yacsi.protocol.BatteryMessage
 import me.speleologist.yacsi.protocol.CalMessage
 import me.speleologist.yacsi.protocol.DistanceOffsetMessage
 import me.speleologist.yacsi.protocol.YacsiReading
+import me.speleologist.yacsi.protocol.parseAccelPositionLine
+import me.speleologist.yacsi.protocol.parseBatteryLine
 import me.speleologist.yacsi.protocol.parseCalLine
 import me.speleologist.yacsi.protocol.parseDistanceOffsetLine
 import me.speleologist.yacsi.protocol.parseYacsiLine
@@ -89,6 +95,14 @@ data class ShotCalibrationState(
     val canFinishEarly: Boolean get() = completedGroups >= minGroups
 }
 
+/** Progress through the rough accelerometer calibration's six positions. */
+data class AccelCalibrationState(
+    val position: Int = 1, // 1-based
+    val positions: Int = 6,
+    val orientation: String = "", // as the device words it, e.g. "X axis pointing up"
+    val isSampling: Boolean = false
+)
+
 /** What the next reading from the device is recorded as. */
 enum class ShotTarget(val label: String, val side: LrudSide?) {
     LEG("Leg", null),
@@ -127,7 +141,9 @@ data class YacsiUiState(
     val warningMessage: String? = null,
     val infoMessage: String? = null,
     val shotCalibration: ShotCalibrationState = ShotCalibrationState(),
+    val accelCalibration: AccelCalibrationState = AccelCalibrationState(),
     val distanceOffsetMm: Int? = null, // null until the device has reported it
+    val isBatteryLow: Boolean = false, // as of the device's check before the last reading
     val survey: SurveyState = SurveyState(),
     val voiceState: VoiceState = VoiceState()
 )
@@ -140,6 +156,14 @@ class YacsiViewModel(application: Application) : AndroidViewModel(application) {
     private var lrudSaveJob: Job? = null
     // Serialises survey file writes so they land in order.
     private val surveyDispatcher = Dispatchers.IO.limitedParallelism(1)
+
+    // Low battery alert; the alarm stream so it is heard even with media muted
+    private var batteryToneGenerator: ToneGenerator? = try {
+        ToneGenerator(AudioManager.STREAM_ALARM, ToneGenerator.MAX_VOLUME)
+    } catch (e: RuntimeException) {
+        Log.e("YacsiViewModel", "Failed to create tone generator", e)
+        null
+    }
 
     private val _uiState = MutableStateFlow(
         YacsiUiState(survey = SurveyState(lrudBeforeLeg = surveyStorage.lrudBeforeLeg))
@@ -263,7 +287,9 @@ class YacsiViewModel(application: Application) : AndroidViewModel(application) {
 
     fun startAccelCalibration() {
         if (!sendCommand("A", "Rough Accelerometer Calibration")) return
-        _uiState.update { it.copy(appMode = AppMode.ACCEL_CALIBRATION) }
+        _uiState.update {
+            it.copy(appMode = AppMode.ACCEL_CALIBRATION, accelCalibration = AccelCalibrationState())
+        }
     }
 
     fun startMagCalibration() {
@@ -277,8 +303,14 @@ class YacsiViewModel(application: Application) : AndroidViewModel(application) {
 
     fun sendCalibrationContinue() {
         // Sends \r for accelerometer calibration step
+        if (_uiState.value.accelCalibration.isSampling) return
         bluetoothService.sendCommand("\r")
         appendLog(">>> Sent Enter (\\r)")
+    }
+
+    /** Stops the rough accelerometer or magnetometer calibration without saving. */
+    fun cancelRoughCalibration() {
+        sendCommand("q", "Cancel Calibration")
     }
 
     // --- Shot (Heeb) calibration ---
@@ -642,6 +674,27 @@ class YacsiViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
+        val battery = parseBatteryLine(line)
+        if (battery != null) {
+            handleBatteryMessage(battery)
+            return
+        }
+
+        val accelPosition = parseAccelPositionLine(line)
+        if (accelPosition != null) {
+            _uiState.update {
+                it.copy(
+                    appMode = AppMode.ACCEL_CALIBRATION,
+                    accelCalibration = AccelCalibrationState(
+                        position = accelPosition.position,
+                        positions = accelPosition.total,
+                        orientation = accelPosition.orientation
+                    )
+                )
+            }
+            return
+        }
+
         // Check if line is a sensor reading
         val reading = parseYacsiLine(line)
         if (reading != null) {
@@ -653,7 +706,9 @@ class YacsiViewModel(application: Application) : AndroidViewModel(application) {
         val mode = _uiState.value.appMode
         if (mode == AppMode.ACCEL_CALIBRATION || mode == AppMode.MAG_CALIBRATION) {
             val upper = line.uppercase()
-            if (upper.contains("CALIBRATION COMPLETE") || upper.contains("OFFSET") ||
+            if (mode == AppMode.ACCEL_CALIBRATION && upper.startsWith("SAMPLING POSITION")) {
+                _uiState.update { it.copy(accelCalibration = it.accelCalibration.copy(isSampling = true)) }
+            } else if (upper.contains("CALIBRATION COMPLETE") || upper.contains("OFFSET") ||
                 upper.contains("SAVED") || upper.contains("FAILED") || upper.contains("STOPPED")
             ) {
                 _uiState.update { it.copy(appMode = AppMode.NORMAL) }
@@ -747,6 +802,17 @@ class YacsiViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /** The device checks the battery before every reading, from its button or the app. */
+    private fun handleBatteryMessage(message: BatteryMessage) {
+        _uiState.update { it.copy(isBatteryLow = message.isLow) }
+        if (!message.isLow) return
+        batteryToneGenerator?.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 1000)
+        val volts = "%.2f V".format(Locale.US, message.millivolts / 1000.0)
+        _uiState.update {
+            it.copy(warningMessage = "Battery low ($volts). Recharge the batteries soon.")
+        }
+    }
+
     private fun ensureShotMode() {
         if (_uiState.value.appMode != AppMode.SHOT_CALIBRATION) {
             _uiState.update { it.copy(appMode = AppMode.SHOT_CALIBRATION) }
@@ -774,6 +840,8 @@ class YacsiViewModel(application: Application) : AndroidViewModel(application) {
 
     override fun onCleared() {
         voiceCommandManager.destroy()
+        batteryToneGenerator?.release()
+        batteryToneGenerator = null
         super.onCleared()
         bluetoothService.disconnect()
     }

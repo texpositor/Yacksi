@@ -13,6 +13,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.BatteryAlert
 import androidx.compose.material.icons.filled.BluetoothConnected
 import androidx.compose.material.icons.filled.BluetoothDisabled
 import androidx.compose.material.icons.automirrored.filled.BluetoothSearching
@@ -218,6 +219,14 @@ fun MainScreen(
                                 modifier = Modifier.padding(horizontal = 4.dp)
                             )
                         }
+                        if (uiState.isBatteryLow) {
+                            Icon(
+                                imageVector = Icons.Default.BatteryAlert,
+                                contentDescription = "Battery low",
+                                tint = MaterialTheme.colorScheme.error,
+                                modifier = Modifier.padding(horizontal = 4.dp)
+                            )
+                        }
                         // Connection state at a glance; connect/disconnect is in the menu
                         Icon(
                             imageVector = when {
@@ -410,21 +419,56 @@ fun MainScreen(
                                 color = MaterialTheme.colorScheme.onTertiaryContainer
                             )
                             Spacer(modifier = Modifier.height(8.dp))
+                            val accel = uiState.accelCalibration
+                            if (uiState.appMode == AppMode.ACCEL_CALIBRATION) {
+                                Text(
+                                    text = "Position ${accel.position} of ${accel.positions}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onTertiaryContainer
+                                )
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    text = when {
+                                        accel.orientation.isEmpty() -> "Waiting for the device…"
+                                        accel.orientation.startsWith("X axis pointing up") ->
+                                            "${accel.orientation} (laser pointing straight up)"
+                                        accel.orientation.startsWith("X axis pointing down") ->
+                                            "${accel.orientation} (laser pointing straight down)"
+                                        else -> accel.orientation
+                                    },
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    fontWeight = FontWeight.Medium,
+                                    color = MaterialTheme.colorScheme.onTertiaryContainer
+                                )
+                                Spacer(modifier = Modifier.height(4.dp))
+                            }
                             Text(
                                 text = when (uiState.appMode) {
-                                    AppMode.ACCEL_CALIBRATION -> "Place device in requested orientation and press Continue."
+                                    AppMode.ACCEL_CALIBRATION -> "Rest the instrument on a stable surface in this orientation, keep it still and press Continue."
                                     else -> "Rotate instrument through all orientations continuously until complete."
                                 },
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onTertiaryContainer
                             )
-                            if (uiState.appMode == AppMode.ACCEL_CALIBRATION) {
-                                Spacer(modifier = Modifier.height(12.dp))
-                                Button(
-                                    onClick = { viewModel.sendCalibrationContinue() },
-                                    modifier = Modifier.fillMaxWidth()
+                            Spacer(modifier = Modifier.height(12.dp))
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                if (uiState.appMode == AppMode.ACCEL_CALIBRATION) {
+                                    Button(
+                                        onClick = { viewModel.sendCalibrationContinue() },
+                                        enabled = accel.orientation.isNotEmpty() && !accel.isSampling,
+                                        modifier = Modifier.weight(2f)
+                                    ) {
+                                        Text(if (accel.isSampling) "Hold still…" else "Continue")
+                                    }
+                                }
+                                TextButton(
+                                    onClick = { viewModel.cancelRoughCalibration() },
+                                    modifier = Modifier.weight(1f)
                                 ) {
-                                    Text("Continue to Next Position")
+                                    Text("Cancel", color = MaterialTheme.colorScheme.error)
                                 }
                             }
                         }

@@ -135,11 +135,13 @@ int32_t readRM3100Axis(uint8_t startReg) {
 }
 
 // Reads all three RM3100 axes in the ADXL355 frame. The RM3100 module's Y axis
-// is reversed relative to the ADXL355, so it is negated here; without this the
-// two sensors have opposite handedness and no rotation can align them.
+// is reversed relative to the ADXL355; without correcting it the two sensors
+// have opposite handedness and no rotation can align them. The module is also
+// mounted rotated 180 deg about Z, which reverses X and Y, so overall only X
+// is negated. Always change two signs together to keep the handedness right.
 void readMagnetometer(int32_t readings[3]) {
-  readings[0] = readRM3100Axis(RM3100_MX2_REG);
-  readings[1] = -readRM3100Axis(RM3100_MX2_REG + 3);
+  readings[0] = -readRM3100Axis(RM3100_MX2_REG);
+  readings[1] = readRM3100Axis(RM3100_MX2_REG + 3);
   readings[2] = readRM3100Axis(RM3100_MX2_REG + 6);
 }
 
@@ -159,6 +161,8 @@ void startReading() {
     sendMessage(true).println("A reading is already in progress.");
     return;
   }
+  // Checked for every reading, whether started from the button or the app.
+  reportBattery();
   reading = true;
   buttonAiming = false;
   if (laserState == 1) {
@@ -289,12 +293,13 @@ void handleCommand(char command) {
     case 'E': eraseHeebCalibration(); break;
     case 'A': startAccelerometerCalibration(); break;
     case 'X': eraseMagCalibration(); break;
+    case 'B': reportBattery(); break;
     case 'H':
     case '?':
-      sendMessage(true).println("Commands: R=read, O=show distance offset, O<mm>=set distance offset, C=shot calibration, F=refit stored shots, D=dump shot calibration, E=erase shot calibration, A=rough accel calibration, M=rough mag calibration, X=erase mag calibration, H=help");
+      sendMessage(true).println("Commands: R=read, O=show distance offset, O<mm>=set distance offset, C=shot calibration, F=refit stored shots, D=dump shot calibration, E=erase shot calibration, A=rough accel calibration, M=rough mag calibration, X=erase mag calibration, B=battery voltage, H=help");
       break;
     default:
-      sendMessage(true).println("Unknown command. Use R, O, C, F, D, E, A, M, X, or H.");
+      sendMessage(true).println("Unknown command. Use R, O, C, F, D, E, A, M, X, B, or H.");
       break;
   }
 }
@@ -398,6 +403,7 @@ void setup() {
   Serial.begin(115200);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   initBuzzer();
+  initBatteryMonitor();
   SerialBT.begin("Yacksi");
   delay(1000);
 

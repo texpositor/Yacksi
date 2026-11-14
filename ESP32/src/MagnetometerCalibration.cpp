@@ -19,6 +19,13 @@ bool isMagnetometerCalibrationActive() {
 bool processMagnetometerCalibrationInput(char input) {
   if (!magCalibrationActive) return false;
 
+  if (input == 'q' || input == 'Q') {
+    magCalibrationActive = false;
+    turnLaserOff();
+    sendMessage(true).println("Magnetometer calibration stopped; saved calibration unchanged.");
+    return true;
+  }
+
   if (input == '\r' || input == '\n') {
     if (millis() - magCalibrationStartTime < 150) return true;
     finishMagnetometerCalibration();
@@ -367,7 +374,7 @@ void startMagnetometerCalibration() {
   lastMagSampleTime = magCalibrationStartTime - MAG_CAL_SAMPLE_INTERVAL_MS;
   sendMessage(false).println("--- Magnetometer calibration ---");
   sendMessage(false).println("Slowly rotate the instrument through all orientations; aim for 300-500 samples.");
-  sendMessage(false).println("Press any key on the serial connection to finish and fit the calibration.");
+  sendMessage(false).println("Press any key on the serial connection to finish and fit the calibration; q cancels.");
 }
 
 bool endMagnetometerCalibration() {

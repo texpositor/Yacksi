@@ -131,7 +131,7 @@ private fun AimingContent(
             modifier = Modifier.weight(1f)
         ) { Text("Fit Now") }
         TextButton(onClick = onAbort, modifier = Modifier.weight(1f)) {
-            Text("Abort", color = MaterialTheme.colorScheme.error)
+            Text("Cancel", color = MaterialTheme.colorScheme.error)
         }
     }
     if (!state.canFinishEarly) {
