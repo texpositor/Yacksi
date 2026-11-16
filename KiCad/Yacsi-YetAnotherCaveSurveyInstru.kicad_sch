@@ -3909,6 +3909,36 @@
 		)
 		(uuid "fe506827-c29a-4145-80c3-84a26c5bd056")
 	)
+	(label "MOSI"
+		(at 201.93 76.2 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "c3fae613-6ace-4e50-b6ed-9312ca627285")
+	)
+	(label "SCLK"
+		(at 199.39 71.12 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "cc91f7a7-ff66-489f-b5e9-4c1ca1a68e19")
+	)
+	(label "MISO"
+		(at 200.66 73.66 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "fb56224e-ef23-415e-ba0a-e57969bad20d")
+	)
 	(symbol
 		(lib_id "my_Library:ADXL355")
 		(at 207.01 49.53 0)
