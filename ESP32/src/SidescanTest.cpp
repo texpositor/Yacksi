@@ -1,0 +1,1 @@
+#include "../test/SidescanTest.cpp"

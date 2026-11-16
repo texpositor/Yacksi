@@ -25,6 +25,13 @@
 #define ADXL355_CS 5
 #define RM3100_CS 15
 
+// VL53L4CD side-scan time-of-flight sensor on the default ESP32 I2C pins.
+// XSHUT (active-low shutdown) lets more sensors share the bus later: each is
+// woken in turn and given its own I2C address.
+#define I2C_SDA 21
+#define I2C_SCL 22
+#define VL53L4CD_XSHUT 13
+
 #define ADXL355_DEVID_AD 0x00
 #define ADXL355_DEVID_MST 0x01
 #define ADXL355_PARTID 0x02
