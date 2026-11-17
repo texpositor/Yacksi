@@ -32,6 +32,20 @@
 #define I2C_SCL 22
 #define VL53L4CD_XSHUT 13
 
+// SACSI side scan: the VL53L4CD measures every SCAN_INTERVAL_MS on its own
+// clock and each result becomes one sample, with the orientation read at that
+// moment and the latest laser distance from the M01 in continuous mode.
+#define SCAN_INTERVAL_MS 250
+// Short so the beam sweeps only a few degrees per reading while spinning.
+#define SCAN_TOF_BUDGET_MS 40
+// Direction the VL53L4CD faces in the instrument frame (X laser, Y left, Z up).
+#define SIDESCAN_DIR_X 0.0f
+#define SIDESCAN_DIR_Y 1.0f
+#define SIDESCAN_DIR_Z 0.0f
+#define SCAN_BATTERY_REPORT_MS 30000
+// Resend the continuous command if the laser has been silent this long.
+#define SCAN_LASER_SILENCE_MS 3000
+
 #define ADXL355_DEVID_AD 0x00
 #define ADXL355_DEVID_MST 0x01
 #define ADXL355_PARTID 0x02
@@ -130,6 +144,7 @@ extern HeebCalibration heebCalibration;
 extern bool heebCalibrationValid;
 extern bool reading;
 extern uint8_t laserCycleState;
+extern int32_t distanceOffsetMm;
 
 void turnLaserOff();
 void turnLaserOn();
@@ -195,5 +210,17 @@ void calibratedVectors(const float rawAccel[3], const float rawMag[3],
 // Returns false when the orientation is undefined (e.g. no field data).
 bool laserBearingInclination(const float g[3], const float m[3],
                              float& bearing, float& inclination);
+// Same for any direction in the instrument frame, e.g. the side-scan beam.
+bool beamBearingInclination(const float g[3], const float m[3], const float beam[3],
+                            float& bearing, float& inclination);
+
+// SACSI side scan (Sidescan.cpp).
+void initSidescan();
+void startScan();
+void stopScan();
+// True from Go until the laser is confirmed stopped after Stop.
+bool isScanBusy();
+bool isScanRunning();
+void serviceScan();
 
 void handleCommand(char command);

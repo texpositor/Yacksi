@@ -54,12 +54,8 @@ bool distanceOffsetEntryActive = false;
 char distanceOffsetEntry[8];
 uint8_t distanceOffsetEntryLength = 0;
 
-// Push button: the first press turns the laser on for aiming and the second
-// takes the reading. The laser turns off again if no reading is taken in time.
+// Push button: starts and stops a side scan (records a point during calibration).
 const unsigned long BUTTON_DEBOUNCE_MS = 30;
-const unsigned long AIM_TIMEOUT_MS = 60000;
-bool buttonAiming = false;
-unsigned long aimStartTime = 0;
 int buttonStableLevel = HIGH;
 int buttonLastLevel = HIGH;
 unsigned long buttonLevelChangeTime = 0;
@@ -157,6 +153,10 @@ void startReading() {
     sendMessage(true).println("Finish calibration before taking a reading.");
     return;
   }
+  if (isScanBusy()) {
+    sendMessage(true).println("Stop the scan before taking a reading.");
+    return;
+  }
   if (reading) {
     sendMessage(true).println("A reading is already in progress.");
     return;
@@ -164,7 +164,6 @@ void startReading() {
   // Checked for every reading, whether started from the button or the app.
   reportBattery();
   reading = true;
-  buttonAiming = false;
   if (laserState == 1) {
     // Already on for aiming, so measure straight away.
     laserCycleState = 2;
@@ -186,14 +185,11 @@ void handleButtonPress() {
     return;
   }
   if (reading) return;
-  if (!buttonAiming || laserState == 0) {
-    turnLaserOn();
-    buttonAiming = true;
-    aimStartTime = millis();
-    return;
+  if (isScanRunning()) {
+    stopScan();
+  } else {
+    startScan();
   }
-  playSound(Sound::Beep);
-  startReading();
 }
 
 void pollButton() {
@@ -206,10 +202,6 @@ void pollButton() {
   if (level != buttonStableLevel && now - buttonLevelChangeTime >= BUTTON_DEBOUNCE_MS) {
     buttonStableLevel = level;
     if (level == LOW) handleButtonPress();
-  }
-  if (buttonAiming && now - aimStartTime >= AIM_TIMEOUT_MS) {
-    buttonAiming = false;
-    if (!reading && !isAnyCalibrationActive()) turnLaserOff();
   }
 }
 
@@ -283,7 +275,16 @@ void startDistanceOffsetEntry() {
 }
 
 void handleCommand(char command) {
-  switch (toupper(static_cast<unsigned char>(command))) {
+  const char upper = toupper(static_cast<unsigned char>(command));
+  // Only scan control and status commands while a scan is running.
+  if (isScanBusy() && upper != 'G' && upper != 'S' && upper != 'B' && upper != 'H' &&
+      upper != '?') {
+    sendMessage(true).println("Stop the scan first (S).");
+    return;
+  }
+  switch (upper) {
+    case 'G': startScan(); break;
+    case 'S': stopScan(); break;
     case 'R': startReading(); break;
     case 'O': startDistanceOffsetEntry(); break;
     case 'M': startMagnetometerCalibration(); break;
@@ -296,10 +297,10 @@ void handleCommand(char command) {
     case 'B': reportBattery(); break;
     case 'H':
     case '?':
-      sendMessage(true).println("Commands: R=read, O=show distance offset, O<mm>=set distance offset, C=shot calibration, F=refit stored shots, D=dump shot calibration, E=erase shot calibration, A=rough accel calibration, M=rough mag calibration, X=erase mag calibration, B=battery voltage, H=help");
+      sendMessage(true).println("Commands: G=go (start side scan), S=stop scan, R=read, O=show distance offset, O<mm>=set distance offset, C=shot calibration, F=refit stored shots, D=dump shot calibration, E=erase shot calibration, A=rough accel calibration, M=rough mag calibration, X=erase mag calibration, B=battery voltage, H=help");
       break;
     default:
-      sendMessage(true).println("Unknown command. Use R, O, C, F, D, E, A, M, X, B, or H.");
+      sendMessage(true).println("Unknown command. Use G, S, R, O, C, F, D, E, A, M, X, B, or H.");
       break;
   }
 }
@@ -404,7 +405,7 @@ void setup() {
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   initBuzzer();
   initBatteryMonitor();
-  SerialBT.begin("Yacksi");
+  SerialBT.begin("Sacsi");
   delay(1000);
 
   pinMode(ENA_PIN, OUTPUT);
@@ -429,6 +430,7 @@ void setup() {
   loadMagCalibration();
   loadHeebCalibration();
   loadDistanceOffset();
+  initSidescan();
   printCalibrationToSerial();
   reportDistanceOffset("CURRENT");
 
@@ -543,4 +545,5 @@ void loop() {
   serviceHeebCalibration();
   takeDistanceReading();
   takeRotationReading();
+  serviceScan();
 }

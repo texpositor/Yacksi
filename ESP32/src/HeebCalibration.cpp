@@ -852,6 +852,30 @@ void calibratedVectors(const float rawAccel[3], const float rawMag[3],
   }
 }
 
+bool beamBearingInclination(const float g[3], const float m[3], const float beam[3],
+                            float& bearing, float& inclination) {
+  bearing = NAN;
+  inclination = NAN;
+  double up[3] = {g[0], g[1], g[2]};
+  double b[3] = {beam[0], beam[1], beam[2]};
+  if (!normalize3(up) || !normalize3(b)) return false;
+  inclination = static_cast<float>(asin(fmax(-1.0, fmin(1.0, dot3(up, b)))) * RAD_TO_DEG_D);
+  if (!heebCalibrationValid && !magCalibrationValid) return false;
+
+  // Same north/east basis as laserDirection().
+  const double md[3] = {m[0], m[1], m[2]};
+  double east[3];
+  cross3(md, up, east);
+  if (!normalize3(east)) return false;
+  double north[3];
+  cross3(up, east, north);
+  double heading = atan2(dot3(east, b), dot3(north, b)) * RAD_TO_DEG_D;
+  if (heading < 0.0) heading += 360.0;
+  if (heading >= 360.0) heading -= 360.0;
+  bearing = static_cast<float>(heading);
+  return true;
+}
+
 bool laserBearingInclination(const float g[3], const float m[3],
                              float& bearing, float& inclination) {
   inclination = atan2f(g[0], sqrtf(g[1] * g[1] + g[2] * g[2])) * (180.0f / PI);
