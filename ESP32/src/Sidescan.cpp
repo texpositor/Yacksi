@@ -16,7 +16,7 @@
 //   SCAN,N=<seq>,T=<ms since Go>,Z_MM=<mm|blank>,Z_AGE_MS=<ms|blank>,LASER_ERR=<code>,
 //        Y_MM=<mm|blank>,Y_STATUS=<code|blank>,HEADING=<deg|nan>,YINCL=<deg>,TILT=<deg>,
 //        AX=..,AY=..,AZ=..,MX=..,MY=..,MZ=..,CAL=SHOT|ROUGH
-//   SCAN,STATE=STOPPED,SAMPLES=<n>
+//   SCAN,STATE=STOPPED,SAMPLES=<n>,TOF_ERRORS=<n>,LASER_RESTARTS=<n>
 // Z_MM includes the distance offset. LASER_ERR is the M01 error code from the
 // most recent laser frame (0 when that frame was a measurement). HEADING and
 // YINCL are the side beam's direction, TILT is the laser's angle from
@@ -40,7 +40,13 @@ const unsigned long STOP_GRACE_MS = 500;
 const uint8_t MAX_STOP_ATTEMPTS = 3;
 // Emit a sample without a side reading if the VL53L4CD misses its slot.
 const unsigned long TOF_MISSING_MS = SCAN_INTERVAL_MS + 150;
-const unsigned long TOF_POLL_MS = 5;
+// Every poll is an I2C transaction. Polling starts TOF_EARLY_POLL_MS before
+// the next result is due and repeats every TOF_POLL_MS until it arrives.
+const unsigned long TOF_POLL_MS = 10;
+const unsigned long TOF_EARLY_POLL_MS = 40;
+const unsigned long SECOND_LASER_OFF_MS = 400;
+// Short I2C timeout so a bus error costs one sample, not a second of samples.
+const uint16_t I2C_TIMEOUT_MS = 20;
 
 enum class Phase : uint8_t { Idle, Starting, WaitingForLaser, Running, Stopping };
 
@@ -51,8 +57,12 @@ Phase phase = Phase::Idle;
 unsigned long phaseStart = 0;
 unsigned long scanStart = 0;
 uint32_t sampleCount = 0;
+uint32_t tofErrors = 0;
+uint32_t laserRestarts = 0;
 unsigned long lastSampleMs = 0;
-unsigned long lastTofPollMs = 0;
+unsigned long nextTofPollMs = 0;
+unsigned long stopStartMs = 0;
+bool secondLaserOffSent = false;
 unsigned long lastBatteryMs = 0;
 unsigned long lastLaserFrameMs = 0;
 unsigned long lastStopCommandMs = 0;
@@ -181,6 +191,7 @@ void serviceRunning() {
   if (now - lastLaserFrameMs >= SCAN_LASER_SILENCE_MS) {
     Serial1.write(continuousCmd, sizeof(continuousCmd));
     lastLaserFrameMs = now;  // throttle the retries
+    ++laserRestarts;
   }
 
   if (now - lastBatteryMs >= SCAN_BATTERY_REPORT_MS) {
@@ -188,14 +199,21 @@ void serviceRunning() {
     reportBattery();
   }
 
-  if (tofAvailable && now - lastTofPollMs >= TOF_POLL_MS) {
-    lastTofPollMs = now;
+  if (tofAvailable && static_cast<long>(now - nextTofPollMs) >= 0) {
+    nextTofPollMs = now + TOF_POLL_MS;
     uint8_t ready = 0;
-    if (tof.VL53L4CD_CheckForDataReady(&ready) == VL53L4CD_ERROR_NONE && ready) {
+    if (tof.VL53L4CD_CheckForDataReady(&ready) != VL53L4CD_ERROR_NONE) {
+      ++tofErrors;
+    } else if (ready) {
       VL53L4CD_Result_t result;
-      tof.VL53L4CD_GetResult(&result);
-      tof.VL53L4CD_ClearInterrupt();
-      sendSample(true, result);
+      const bool readOk = tof.VL53L4CD_GetResult(&result) == VL53L4CD_ERROR_NONE;
+      if (tof.VL53L4CD_ClearInterrupt() != VL53L4CD_ERROR_NONE || !readOk) ++tofErrors;
+      // The next result is due one interval from now, so leave the bus alone
+      // until shortly before then: every I2C transaction risks an error, and
+      // an I2C error stalls the loop for over a second.
+      nextTofPollMs = now + SCAN_INTERVAL_MS - TOF_EARLY_POLL_MS;
+      // A failed read is sent without a side distance rather than as a bogus one.
+      sendSample(readOk, result);
       return;
     }
   }
@@ -207,6 +225,12 @@ void serviceRunning() {
 
 void serviceStopping() {
   const unsigned long now = millis();
+  // The first laser off can end continuous mode yet leave the laser lit, so
+  // always send a second one once the stream has had time to stop.
+  if (!secondLaserOffSent && now - stopStartMs >= SECOND_LASER_OFF_MS) {
+    turnLaserOff();
+    secondLaserOffSent = true;
+  }
   // A measurement well after the laser off command means the module ignored it.
   if (pollLaser() && now - lastStopCommandMs > STOP_GRACE_MS &&
       stopAttempts < MAX_STOP_ATTEMPTS) {
@@ -225,7 +249,10 @@ void serviceStopping() {
 
 void initSidescan() {
   Wire.begin(I2C_SDA, I2C_SCL);
-  Wire.setClock(400000);
+  // 100 kHz is ample for one reading every 250 ms and more tolerant of the
+  // wiring and of noise from the laser than 400 kHz.
+  Wire.setClock(100000);
+  Wire.setTimeOut(I2C_TIMEOUT_MS);
   tof.begin();
   // Cycles XSHUT, checks the sensor ID and loads the default configuration.
   tofAvailable = tof.InitSensor() == VL53L4CD_ERROR_NONE &&
@@ -262,6 +289,8 @@ void startScan() {
   phaseStart = now;
   scanStart = now;
   sampleCount = 0;
+  tofErrors = 0;
+  laserRestarts = 0;
   lastSampleMs = now;
   lastBatteryMs = now;
   lastLaserFrameMs = now;
@@ -273,16 +302,22 @@ void startScan() {
 
 void stopScan() {
   if (!isScanRunning()) {
-    sendMessage(true).println("No scan is running.");
+    // Still useful as a manual "laser off" if the laser was left lit.
+    turnLaserOff();
+    sendMessage(true).println("No scan is running; laser off sent.");
     return;
   }
   turnLaserOff();
   if (tofAvailable) tof.VL53L4CD_StopRanging();
   phase = Phase::Stopping;
   lastStopCommandMs = millis();
+  stopStartMs = lastStopCommandMs;
+  secondLaserOffSent = false;
   stopAttempts = 0;
-  sendMessage(true).printf("SCAN,STATE=STOPPED,SAMPLES=%lu\n",
-                           static_cast<unsigned long>(sampleCount));
+  sendMessage(true).printf("SCAN,STATE=STOPPED,SAMPLES=%lu,TOF_ERRORS=%lu,LASER_RESTARTS=%lu\n",
+                           static_cast<unsigned long>(sampleCount),
+                           static_cast<unsigned long>(tofErrors),
+                           static_cast<unsigned long>(laserRestarts));
   playSound(Sound::Success);
 }
 
@@ -306,6 +341,7 @@ void serviceScan() {
       if (pollLaser() || millis() - phaseStart >= FIRST_LASER_TIMEOUT_MS) {
         if (tofAvailable) tof.VL53L4CD_ClearInterrupt();  // drop the stale side reading
         lastSampleMs = millis();
+        nextTofPollMs = lastSampleMs;
         phase = Phase::Running;
       }
       break;

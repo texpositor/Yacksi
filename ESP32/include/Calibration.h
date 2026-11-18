@@ -4,6 +4,13 @@
 #include <BluetoothSerial.h>
 #include <Preferences.h>
 
+// Bump FIRMWARE_VERSION for each release. BUILD_TIME and BUILD_GIT are
+// generated on every build by scripts/build_info.py (src/BuildInfo.cpp).
+#define FIRMWARE_NAME "SACSI"
+#define FIRMWARE_VERSION "0.1.0"
+extern const char* const BUILD_TIME;
+extern const char* const BUILD_GIT;
+
 #define RXD2 33
 #define TXD2 32
 #define ENA_PIN 25
@@ -36,15 +43,17 @@
 // clock and each result becomes one sample, with the orientation read at that
 // moment and the latest laser distance from the M01 in continuous mode.
 #define SCAN_INTERVAL_MS 250
-// Short so the beam sweeps only a few degrees per reading while spinning.
-#define SCAN_TOF_BUDGET_MS 40
+// Measurement window per side reading. Longer gives more range and fewer weak
+// (status 2) readings; at one turn per 10 s, 100 ms sweeps about 3.6 deg.
+#define SCAN_TOF_BUDGET_MS 100
 // Direction the VL53L4CD faces in the instrument frame (X laser, Y left, Z up).
 #define SIDESCAN_DIR_X 0.0f
 #define SIDESCAN_DIR_Y 1.0f
 #define SIDESCAN_DIR_Z 0.0f
 #define SCAN_BATTERY_REPORT_MS 30000
-// Resend the continuous command if the laser has been silent this long.
-#define SCAN_LASER_SILENCE_MS 3000
+// Resend the continuous command if the laser has been silent this long
+// (readings normally arrive every ~350 ms).
+#define SCAN_LASER_SILENCE_MS 1500
 
 #define ADXL355_DEVID_AD 0x00
 #define ADXL355_DEVID_MST 0x01

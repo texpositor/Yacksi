@@ -274,11 +274,17 @@ void startDistanceOffsetEntry() {
   distanceOffsetEntryLength = 0;
 }
 
+// Machine-readable firmware identity, sent at boot and with the help text.
+void reportVersion() {
+  sendMessage(true).printf("FIRMWARE=%s,VERSION=%s,BUILD=%s,GIT=%s\n", FIRMWARE_NAME,
+                           FIRMWARE_VERSION, BUILD_TIME, BUILD_GIT);
+}
+
 void handleCommand(char command) {
   const char upper = toupper(static_cast<unsigned char>(command));
   // Only scan control and status commands while a scan is running.
-  if (isScanBusy() && upper != 'G' && upper != 'S' && upper != 'B' && upper != 'H' &&
-      upper != '?') {
+  if (isScanBusy() && upper != 'G' && upper != 'S' && upper != 'B' && upper != 'V' &&
+      upper != 'H' && upper != '?') {
     sendMessage(true).println("Stop the scan first (S).");
     return;
   }
@@ -295,12 +301,14 @@ void handleCommand(char command) {
     case 'A': startAccelerometerCalibration(); break;
     case 'X': eraseMagCalibration(); break;
     case 'B': reportBattery(); break;
+    case 'V': reportVersion(); break;
     case 'H':
     case '?':
-      sendMessage(true).println("Commands: G=go (start side scan), S=stop scan, R=read, O=show distance offset, O<mm>=set distance offset, C=shot calibration, F=refit stored shots, D=dump shot calibration, E=erase shot calibration, A=rough accel calibration, M=rough mag calibration, X=erase mag calibration, B=battery voltage, H=help");
+      reportVersion();
+      sendMessage(true).println("Commands: G=go (start side scan), S=stop scan, R=read, O=show distance offset, O<mm>=set distance offset, C=shot calibration, F=refit stored shots, D=dump shot calibration, E=erase shot calibration, A=rough accel calibration, M=rough mag calibration, X=erase mag calibration, B=battery voltage, V=firmware version, H=help");
       break;
     default:
-      sendMessage(true).println("Unknown command. Use G, S, R, O, C, F, D, E, A, M, X, B, or H.");
+      sendMessage(true).println("Unknown command. Use G, S, R, O, C, F, D, E, A, M, X, B, V, or H.");
       break;
   }
 }
