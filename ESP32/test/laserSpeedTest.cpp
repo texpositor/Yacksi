@@ -14,7 +14,15 @@
 //              payload 0x00 / 0x01 / 0x02 (only 0x00 has worked so far)
 //   4 / 5 / 6  continuous measurement (reg 0x0021) for 10 s, payload
 //              0x00 / 0x01 / 0x02, then tries each way of stopping it in turn
-//   s          try each way of stopping continuous mode on a fresh stream
+//   c          start continuous measurement and leave it running
+//   s1 .. s6   send one stop method (list with s alone):
+//              1 0x58 stop byte, 2 laser off, 3 single measurement,
+//              4 continuous again, 5 ENA low for 1 s, 6 laser on
+//   q          send laser off until the laser is silent
+//   S          try every stop method in turn on a fresh stream each time
+// Whenever no test is running, every frame from the laser is printed with the
+// time since the last command, so after c and sN you can see (and watch the
+// laser dot) whether readings stop.
 //   m          magnetometer with laser off / pointer on / single / continuous
 //   a          run 1, 4, 5, 6 and m in turn
 //   l          laser pointer on, o  laser off
@@ -40,6 +48,14 @@
 //   ENA low for 1 s halts it, but the stream seems to resume at the next
 //   laser on, so ENA pauses rather than cancels continuous mode.
 // - Magnetometer shift from the laser: at most 0.2 uT in any mode.
+//
+// Second M01 module (fitted after the first failed, Nov 2026):
+// - Continuous: a reading every 0.6-0.9 s on a nearby target, and slow to
+//   acknowledge commands while measuring (up to ~2.7 s).
+// - Laser off is acknowledged but does NOT end continuous mode. Sending the
+//   continuous command again toggles continuous mode off (s4). 0x58 and a
+//   single-measurement command do not stop it, and ENA appears to have no
+//   effect on this module.
 
 static const uint8_t laserOnCmd[] = {0xAA, 0x00, 0x01, 0xBE, 0x00, 0x01, 0x00, 0x01, 0xC1};
 static const uint8_t laserOffCmd[] = {0xAA, 0x00, 0x01, 0xBE, 0x00, 0x01, 0x00, 0x00, 0xC0};
@@ -247,15 +263,26 @@ static const char* stopContinuous() {
 // Prints every frame for the window with its arrival time. Returns how many
 // measurement frames arrived after the first 500 ms (earlier ones may already
 // have been in flight when a stop was sent).
-static int dumpFrames(uint32_t windowMs) {
+// With stopAfter > 0, returns as soon as that many measurements have arrived.
+static int dumpFrames(uint32_t windowMs, int stopAfter = 0) {
   const uint32_t start = millis();
   int late = 0;
+  int measurements = 0;
   for (uint32_t used; (used = millis() - start) < windowMs;) {
     uint8_t frame[MAX_FRAME];
     const size_t length = readFrame(frame, windowMs - used);
     if (!length) break;
     const uint32_t at = millis() - start;
-    if (isMeasurement(frame, length) && at > 500) ++late;
+    if (isMeasurement(frame, length)) {
+      ++measurements;
+      if (at > 500) ++late;
+    }
+    if (stopAfter > 0 && measurements >= stopAfter) {
+      Serial.printf("    %5lu ms  ", (unsigned long)at);
+      printFrame(frame, length);
+      Serial.println();
+      return measurements;
+    }
     Serial.printf("    %5lu ms  ", (unsigned long)at);
     printFrame(frame, length);
     Serial.println();
@@ -281,35 +308,67 @@ static const StopMethod stopMethods[] = {
   {"single-measurement command", [] { sendMeasure(0x00); }},
   {"continuous command again", [] { sendContinuous(0x00); }},
   {"ENA low for 1 s", [] { enaPowerCycle(); }},
+  {"laser on command", [] { laserOn(); }},
 };
+static const int STOP_METHOD_COUNT = sizeof(stopMethods) / sizeof(stopMethods[0]);
 
-// Starts a fresh continuous stream for each method, applies it, and watches
-// for 4 s whether measurements keep coming.
+// Counts measurement frames in the window, ignoring other frames such as the
+// acknowledgement of the command just sent.
+static int measurementsWithin(uint32_t windowMs) {
+  const uint32_t start = millis();
+  int count = 0;
+  for (uint32_t used; (used = millis() - start) < windowMs;) {
+    uint8_t frame[MAX_FRAME];
+    const size_t length = readFrame(frame, windowMs - used);
+    if (!length) break;
+    if (isMeasurement(frame, length)) ++count;
+  }
+  return count;
+}
+
+// Sends laser off until no readings arrive for 2.5 s, and reports how many
+// it took. This is also the main experiment: whether, and how reliably, laser
+// off ends a running continuous stream on this module.
+static void quiesce() {
+  const int MAX_TRIES = 8;
+  for (int attempt = 1; attempt <= MAX_TRIES; ++attempt) {
+    laserOff();
+    delay(300);  // readings already in flight
+    flushLaser();
+    if (measurementsWithin(2500) == 0) {
+      Serial.printf("RESULT quiesce: silent after %d laser off command(s)\n", attempt);
+      return;
+    }
+  }
+  Serial.printf("RESULT quiesce: STILL STREAMING after %d laser off commands\n", MAX_TRIES);
+}
+
+// For each method: make sure the module is silent, start a fresh continuous
+// stream, wait until it is really producing readings, apply the method, and
+// watch for 6 s whether measurements keep coming.
 static void stopTest() {
   Serial.println();
   Serial.println("=== Ways to stop continuous measurement ===");
   for (const StopMethod& method : stopMethods) {
     Serial.printf("--- %s ---\n", method.name);
+    quiesce();
     laserOn();
     delay(500);
     flushLaser();
     sendContinuous(0x00);
-    Serial.println("  started:");
-    dumpFrames(1500);
+    // Only a stream that is really producing readings shows whether a stop works.
+    Serial.println("  started (waiting for 2 readings, up to 8 s):");
+    const int before = dumpFrames(8000, 2);
     Serial.println("  after stop:");
     method.apply();
-    const int late = dumpFrames(4000);
+    const int late = dumpFrames(6000);
     Serial.printf("RESULT stop by %s: %s\n", method.name,
-                  late ? "STILL STREAMING" : "stopped");
-    if (late) {  // make sure the next method starts from a stopped module
-      enaPowerCycle();
-      laserOff();
-      delay(300);
-      flushLaser();
-      if (bytesWithin(1500)) Serial.println("  (still streaming even after ENA power cycle)");
-    }
+                  before < 2 ? "INCONCLUSIVE (no readings before the stop; aim at a wall 1-3 m away)"
+                  : late    ? "STILL STREAMING"
+                            : "stopped");
   }
-  laserOff();
+  Serial.println("--- final clean-up ---");
+  quiesce();
 }
 
 static void continuousTest(uint8_t mode) {
@@ -532,8 +591,53 @@ static void probe() {
 }
 
 static void printHelp() {
-  Serial.println("Commands: p probe wiring, 1/2/3 single 0x00-0x02, 4/5/6 continuous 0x00-0x02, s stop methods, "
+  Serial.println("Commands: p probe wiring, 1/2/3 single 0x00-0x02, 4/5/6 continuous 0x00-0x02, "
+                 "c start continuous, s1-s6 one stop method, q laser off until silent, S all stop methods, "
                  "m magnetometer, a all, l laser on, o laser off, r raw bytes");
+}
+
+static uint32_t lastCommandMs = 0;
+
+// Prints laser frames as they arrive, timed from the last command.
+static void monitorLaser() {
+  while (Serial1.available()) {
+    uint8_t frame[MAX_FRAME];
+    const size_t length = readFrame(frame, 50);  // a frame takes ~14 ms at 9600 baud
+    if (!length) return;
+    Serial.printf("  +%5lu ms  ", (unsigned long)(millis() - lastCommandMs));
+    printFrame(frame, length);
+    Serial.println();
+  }
+}
+
+static void startContinuous() {
+  laserOn();
+  delay(500);  // as in the tests that worked; the laser on reply prints below
+  monitorLaser();
+  sendContinuous(0x00);
+  lastCommandMs = millis();
+  Serial.println("Sent continuous measurement; readings print as they arrive.");
+}
+
+// "s" followed by a digit sends that stop method; "s" alone lists them.
+static void stopMethodCommand() {
+  const uint32_t start = millis();
+  int digit = -1;
+  while (millis() - start < 2000) {
+    if (!Serial.available()) continue;
+    const char c = Serial.read();
+    if (c >= '1' && c <= '9') digit = c - '0';
+    break;
+  }
+  if (digit < 1 || digit > STOP_METHOD_COUNT) {
+    Serial.println("Stop methods (type s and the number):");
+    for (int i = 0; i < STOP_METHOD_COUNT; ++i) Serial.printf("  s%d  %s\n", i + 1, stopMethods[i].name);
+    return;
+  }
+  const StopMethod& method = stopMethods[digit - 1];
+  method.apply();
+  lastCommandMs = millis();
+  Serial.printf("Sent stop method %d: %s. Watch for readings below and for the laser dot.\n", digit, method.name);
 }
 
 void setup() {
@@ -561,6 +665,7 @@ void setup() {
 }
 
 void loop() {
+  monitorLaser();
   if (!Serial.available()) return;
   switch (Serial.read()) {
     case 'p': probe(); break;
@@ -570,7 +675,10 @@ void loop() {
     case '4': continuousTest(0x00); break;
     case '5': continuousTest(0x01); break;
     case '6': continuousTest(0x02); break;
-    case 's': stopTest(); break;
+    case 'c': startContinuous(); break;
+    case 's': stopMethodCommand(); break;
+    case 'S': stopTest(); break;
+    case 'q': quiesce(); lastCommandMs = millis(); break;
     case 'm': magTest(); break;
     case 'a':
       singleShotTest(0x00);
@@ -578,8 +686,8 @@ void loop() {
       magTest();
       Serial.println("\n=== All tests done; copy the RESULT lines (or everything) back ===");
       break;
-    case 'l': laserOn(); Serial.println("Laser on"); break;
-    case 'o': laserOff(); Serial.println("Laser off"); break;
+    case 'l': laserOn(); lastCommandMs = millis(); Serial.println("Laser on"); break;
+    case 'o': laserOff(); lastCommandMs = millis(); Serial.println("Laser off"); break;
     case 'r': rawDump(); break;
     case '\r': case '\n': case ' ': break;
     default: printHelp(); break;

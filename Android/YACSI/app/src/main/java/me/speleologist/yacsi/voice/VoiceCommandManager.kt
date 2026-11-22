@@ -60,7 +60,7 @@ class VoiceCommandManager(private val context: Context) : RecognitionListener {
             model = loadedModel
             _state.value = _state.value.copy(
                 isInitialized = true,
-                statusMessage = "Voice active: 'yak see leg / section / left 1234'"
+                statusMessage = "Voice active: say 'go' or 'stop'"
             )
             startListening()
         }, { exception ->
@@ -85,7 +85,7 @@ class VoiceCommandManager(private val context: Context) : RecognitionListener {
             }
             _state.value = _state.value.copy(
                 isListening = true,
-                statusMessage = "Listening for 'yak see leg / section / left 1234'..."
+                statusMessage = "Listening for 'go' / 'stop'..."
             )
         } catch (e: Exception) {
             Log.e("VoiceCommandManager", "Failed to start speech service", e)
@@ -146,14 +146,9 @@ class VoiceCommandManager(private val context: Context) : RecognitionListener {
             // statusMessage is left alone; the caller announces recognised commands
             _state.value = _state.value.copy(lastAction = action)
             when (action) {
-                // Single beep for leg and for an LRUD value, double beep for section
-                VoiceAction.SetTargetLeg, is VoiceAction.SetLrud ->
-                    toneGenerator?.startTone(ToneGenerator.TONE_PROP_BEEP, 200)
-                VoiceAction.SetTargetSection ->
-                    toneGenerator?.startTone(ToneGenerator.TONE_PROP_BEEP2, 400)
-                // Error tone: a side was heard but the number wasn't
-                is VoiceAction.MissingNumber ->
-                    toneGenerator?.startTone(ToneGenerator.TONE_PROP_NACK, 400)
+                // Single beep for go, double beep for stop
+                VoiceAction.Go -> toneGenerator?.startTone(ToneGenerator.TONE_PROP_BEEP, 200)
+                VoiceAction.Stop -> toneGenerator?.startTone(ToneGenerator.TONE_PROP_BEEP2, 400)
             }
             onCommandRecognized?.invoke(action)
         } catch (e: Exception) {

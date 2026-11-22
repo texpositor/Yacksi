@@ -40,8 +40,6 @@ import androidx.compose.ui.unit.sp
 import me.speleologist.yacsi.bluetooth.ConnectionState
 import me.speleologist.yacsi.viewmodel.AppMode
 import me.speleologist.yacsi.viewmodel.YacsiViewModel
-import kotlinx.coroutines.flow.filter
-import java.time.LocalDate
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -58,7 +56,7 @@ fun MainScreen(
 
     var selectedTab by rememberSaveable { mutableIntStateOf(0) }
     var isTouchLocked by rememberSaveable { mutableStateOf(false) }
-    val isTouchLockedState = rememberUpdatedState(isTouchLocked)
+    // Go was pressed before a folder for run files was chosen; start once one is
     val focusManager = LocalFocusManager.current
     val context = LocalContext.current
 
@@ -77,12 +75,13 @@ fun MainScreen(
     val listState = rememberLazyListState()
     val clipboardManager = LocalClipboardManager.current
 
-    val newSurveyLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.CreateDocument("text/csv")
-    ) { uri -> uri?.let { viewModel.createSurvey(it) } }
-    val openSurveyLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenDocument()
-    ) { uri -> uri?.let { viewModel.openSurvey(it) } }
+    var goAfterFolderChosen by rememberSaveable { mutableStateOf(false) }
+    val runFolderLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        if (uri != null) viewModel.setRunFolder(uri, thenGo = goAfterFolderChosen)
+        goAfterFolderChosen = false
+    }
 
     // Auto-scroll logs to bottom when new lines arrive
     LaunchedEffect(uiState.rawLogs.size, selectedTab) {
@@ -200,7 +199,7 @@ fun MainScreen(
                     title = {
                         // Tapping the title is a quick way to lock the touch screen
                         Text(
-                            "YACSI",
+                            "SACSI",
                             style = MaterialTheme.typography.titleMedium,
                             modifier = Modifier
                                 .clickable(onClickLabel = "Lock touch screen") {
@@ -297,17 +296,12 @@ fun MainScreen(
                                         isTouchLocked = true
                                     }
                                 )
-                                // What the device button shoots after a leg: L, R, U, D first, or the next leg
                                 DropdownMenuItem(
-                                    text = { Text("Shoot LRUD Before Each Leg") },
-                                    trailingIcon = {
-                                        if (uiState.survey.lrudBeforeLeg) {
-                                            Icon(Icons.Default.Check, contentDescription = "On")
-                                        }
-                                    },
+                                    text = { Text("Folder for Run Files…") },
+                                    enabled = !uiState.scan.isRunning,
                                     onClick = {
                                         showMenu = false
-                                        viewModel.setLrudBeforeLeg(!uiState.survey.lrudBeforeLeg)
+                                        runFolderLauncher.launch(null)
                                     }
                                 )
                                 HorizontalDivider()
@@ -475,85 +469,28 @@ fun MainScreen(
                     }
                 }
 
-                // Parsed Data Display
-                val reading = uiState.latestReading
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
-                ) {
-                    Column(modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp)) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            MetricItem(
-                                label = "Distance",
-                                value = if (reading != null) "${reading.distMm.toInt()} mm" else "---",
-                                modifier = Modifier.weight(1f)
-                            )
-                            MetricItem(
-                                label = "Bearing",
-                                value = if (reading != null) {
-                                    if (reading.bearing != null) "%.1f°".format(reading.bearing) else "nan"
-                                } else "---",
-                                modifier = Modifier.weight(1f)
-                            )
-                            MetricItem(
-                                label = "Inclination",
-                                value = if (reading != null) "%.1f°".format(reading.incl) else "---",
-                                modifier = Modifier.weight(1f)
-                            )
-                        }
-
-                        if (reading?.calibration != null) {
-                            Spacer(modifier = Modifier.height(2.dp))
-                            // Under the shot calibration the field magnitude is 1.0; a large
-                            // deviation suggests nearby iron or electrical interference.
-                            val interference = reading.calibration == "SHOT" &&
-                                reading.mLen != null && kotlin.math.abs(reading.mLen - 1f) > 0.05f
-                            Text(
-                                text = buildString {
-                                    append(if (reading.calibration == "SHOT") "Shot calibration" else "Rough calibration only")
-                                    reading.mLen?.let { append("  ·  field %.3f".format(it)) }
-                                    reading.laserMm?.let { laserMm ->
-                                        val offsetMm = (reading.distMm - laserMm).toInt()
-                                        if (offsetMm != 0) append("  ·  distance offset %+d mm".format(offsetMm))
-                                    }
-                                    if (interference) append("  ·  possible magnetic interference")
-                                },
-                                style = MaterialTheme.typography.bodySmall,
-                                color = if (interference || reading.calibration != "SHOT") {
-                                    MaterialTheme.colorScheme.error
-                                } else {
-                                    MaterialTheme.colorScheme.outline
-                                }
-                            )
-                        }
-                    }
-                }
-
                 PrimaryTabRow(selectedTabIndex = selectedTab) {
                     // Content overload so the tabs can be shorter than the default 48dp
-                    Tab(selected = selectedTab == 0, onClick = { selectedTab = 0 }, modifier = Modifier.height(36.dp)) { Text("Survey") }
+                    Tab(selected = selectedTab == 0, onClick = { selectedTab = 0 }, modifier = Modifier.height(36.dp)) { Text("Scan") }
                     Tab(selected = selectedTab == 1, onClick = { selectedTab = 1 }, modifier = Modifier.height(36.dp)) { Text("Log") }
                 }
 
                 if (selectedTab == 0) {
-                    SurveyPanel(
-                        state = uiState.survey,
-                        canTakeReading = deviceMenuEnabled,
-                        onTakeReading = viewModel::takeReading,
-                        onNewSurvey = { newSurveyLauncher.launch("survey-${LocalDate.now()}.csv") },
-                        onOpenSurvey = {
-                            openSurveyLauncher.launch(arrayOf("text/*", "application/csv", "application/octet-stream"))
+                    ScanPanel(
+                        state = uiState.scan,
+                        firmware = uiState.firmware,
+                        canGo = deviceMenuEnabled && !uiState.scan.isRunning,
+                        canStop = uiState.scan.isRunning || isConnected,
+                        onGo = {
+                            if (viewModel.hasRunFolder) {
+                                viewModel.go()
+                            } else {
+                                goAfterFolderChosen = true
+                                runFolderLauncher.launch(null)
+                            }
                         },
-                        onAtChange = viewModel::setAtStation,
-                        onToChange = viewModel::setToStation,
-                        onLrudChange = viewModel::setLrud,
-                        onTargetChange = viewModel::setShotTarget,
-                        onUndoLastLeg = viewModel::undoLastLeg,
-                        // No focus (and so no keyboard) while the touch screen is locked
-                        lrudFocusRequests = remember { viewModel.lrudFocusRequests.filter { !isTouchLockedState.value } },
+                        onStop = viewModel::stop,
+                        onChooseFolder = { runFolderLauncher.launch(null) },
                         modifier = Modifier
                             .fillMaxWidth()
                             .weight(1f)
@@ -578,9 +515,6 @@ fun MainScreen(
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     modifier = Modifier.weight(1f)
                                 )
-                                TextButton(onClick = { viewModel.takeReading() }, enabled = deviceMenuEnabled) {
-                                    Text("Take Reading")
-                                }
                                 if (uiState.rawLogs.isNotEmpty()) {
                                     IconButton(
                                         onClick = {
@@ -684,7 +618,12 @@ private fun TouchLockOverlay(onUnlock: () -> Unit) {
 }
 
 @Composable
-fun MetricItem(label: String, value: String, modifier: Modifier = Modifier) {
+fun MetricItem(
+    label: String,
+    value: String,
+    modifier: Modifier = Modifier,
+    valueColor: Color = MaterialTheme.colorScheme.primary
+) {
     Column(modifier = modifier, horizontalAlignment = Alignment.CenterHorizontally) {
         Text(
             text = label,
@@ -695,7 +634,7 @@ fun MetricItem(label: String, value: String, modifier: Modifier = Modifier) {
             text = value,
             style = MaterialTheme.typography.titleLarge,
             fontWeight = FontWeight.Bold,
-            color = MaterialTheme.colorScheme.primary
+            color = valueColor
         )
     }
 }

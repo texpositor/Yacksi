@@ -51,9 +51,6 @@ extern const char* const BUILD_GIT;
 #define SIDESCAN_DIR_Y 1.0f
 #define SIDESCAN_DIR_Z 0.0f
 #define SCAN_BATTERY_REPORT_MS 30000
-// Resend the continuous command if the laser has been silent this long
-// (readings normally arrive every ~350 ms).
-#define SCAN_LASER_SILENCE_MS 1500
 
 #define ADXL355_DEVID_AD 0x00
 #define ADXL355_DEVID_MST 0x01

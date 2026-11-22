@@ -16,7 +16,10 @@
 //   SCAN,N=<seq>,T=<ms since Go>,Z_MM=<mm|blank>,Z_AGE_MS=<ms|blank>,LASER_ERR=<code>,
 //        Y_MM=<mm|blank>,Y_STATUS=<code|blank>,HEADING=<deg|nan>,YINCL=<deg>,TILT=<deg>,
 //        AX=..,AY=..,AZ=..,MX=..,MY=..,MZ=..,CAL=SHOT|ROUGH
-//   SCAN,STATE=STOPPED,SAMPLES=<n>,TOF_ERRORS=<n>,LASER_RESTARTS=<n>
+//   SCAN,STATE=STOPPED,SAMPLES=<n>,TOF_ERRORS=<n>
+//   LASER_OFF=<how>,COMMANDS=<n>  once the laser has stopped, where <how> is
+//        LASER_OFF (the laser off command did it), TOGGLED (a second
+//        continuous command did it) or POWER_CYCLED (ENA, last resort)
 // Z_MM includes the distance offset. LASER_ERR is the M01 error code from the
 // most recent laser frame (0 when that frame was a measurement). HEADING and
 // YINCL are the side beam's direction, TILT is the laser's angle from
@@ -27,28 +30,41 @@ namespace {
 // Laser frames: AA, addr, reg(2), count(2), payload, checksum (sum of the
 // bytes after AA). Measurement replies (reg 0x0020-0x0022, count 4) are 13
 // bytes with the distance as BCD in bytes 6-9; other replies carry count * 2
-// payload bytes. Errors come back on reg 0x0000. The laser off command is the
-// only reliable way to end continuous mode (see test/laserSpeedTest.cpp).
+// payload bytes. Errors come back on reg 0x0000.
+//
+// Ending continuous mode differs between M01 modules (test/laserSpeedTest.cpp):
+// on the first, the laser off command ended it; on the second, laser off is
+// acknowledged (AA 00 01 BE 00 01 00 00 C0) but ignored, and a second
+// continuous command toggles continuous mode off. So Stop tries laser off,
+// then the toggle if readings carry on. Because of the toggle, the continuous
+// command must never be resent while a scan is running.
 const uint8_t continuousCmd[] = {0xAA, 0x00, 0x00, 0x21, 0x00, 0x01, 0x00, 0x00, 0x22};
 const size_t MAX_FRAME = 32;
 // Laser on, then the continuous command after this delay (as in the bench test).
 const unsigned long LASER_START_DELAY_MS = 500;
 // Samples wait this long for the first laser reading, then start without one.
 const unsigned long FIRST_LASER_TIMEOUT_MS = 2500;
-const unsigned long STOP_CHECK_MS = 1500;
-const unsigned long STOP_GRACE_MS = 500;
-const uint8_t MAX_STOP_ATTEMPTS = 3;
+// Stop: after each command, a reading that arrives once the command has been
+// acknowledged (or STOP_ACK_TIMEOUT_MS after it, if no acknowledgement comes)
+// means the laser is still measuring, so the other command is tried. The
+// laser counts as stopped after STOP_QUIET_MS with no readings. After
+// MAX_STOP_COMMANDS, ENA is pulled low as a last resort.
+const unsigned long STOP_ACK_TIMEOUT_MS = 1500;
+const unsigned long STOP_QUIET_MS = 2500;
+const uint8_t MAX_STOP_COMMANDS = 6;
+const unsigned long ENA_OFF_MS = 1000;
+const unsigned long ENA_BOOT_MS = 500;
 // Emit a sample without a side reading if the VL53L4CD misses its slot.
 const unsigned long TOF_MISSING_MS = SCAN_INTERVAL_MS + 150;
 // Every poll is an I2C transaction. Polling starts TOF_EARLY_POLL_MS before
 // the next result is due and repeats every TOF_POLL_MS until it arrives.
 const unsigned long TOF_POLL_MS = 10;
 const unsigned long TOF_EARLY_POLL_MS = 40;
-const unsigned long SECOND_LASER_OFF_MS = 400;
 // Short I2C timeout so a bus error costs one sample, not a second of samples.
 const uint16_t I2C_TIMEOUT_MS = 20;
 
 enum class Phase : uint8_t { Idle, Starting, WaitingForLaser, Running, Stopping };
+enum class StopStep : uint8_t { AfterLaserOff, AfterToggle, EnaLow, EnaBoot };
 
 VL53L4CD tof(&Wire, VL53L4CD_XSHUT);
 bool tofAvailable = false;
@@ -58,15 +74,17 @@ unsigned long phaseStart = 0;
 unsigned long scanStart = 0;
 uint32_t sampleCount = 0;
 uint32_t tofErrors = 0;
-uint32_t laserRestarts = 0;
 unsigned long lastSampleMs = 0;
 unsigned long nextTofPollMs = 0;
-unsigned long stopStartMs = 0;
-bool secondLaserOffSent = false;
 unsigned long lastBatteryMs = 0;
-unsigned long lastLaserFrameMs = 0;
-unsigned long lastStopCommandMs = 0;
-uint8_t stopAttempts = 0;
+StopStep stopStep = StopStep::AfterLaserOff;
+unsigned long stopStepStart = 0;
+unsigned long stopQuietSince = 0;
+uint8_t stopCommands = 0;
+bool stopStepAcked = false;
+// Set by pollLaser when the matching acknowledgement arrives.
+bool laserOffAcked = false;
+bool continuousAcked = false;
 
 bool haveLaserDistance = false;
 uint32_t laserDistanceMm = 0;
@@ -123,11 +141,14 @@ bool pollLaser() {
       laserDistanceMs = now;
       haveLaserDistance = true;
       laserError = 0;
-      lastLaserFrameMs = now;
       measured = true;
     } else if (frameLength == 9 && frame[2] == 0x00 && frame[3] == 0x00) {
       laserError = (uint16_t(frame[6]) << 8) | frame[7];
-      lastLaserFrameMs = now;
+    } else if (frameLength == 9 && frame[2] == 0x01 && frame[3] == 0xBE &&
+               frame[6] == 0x00 && frame[7] == 0x00) {
+      laserOffAcked = true;  // AA 00 01 BE 00 01 00 00 C0
+    } else if (frameLength == 9 && frame[2] == 0x00 && frame[3] == 0x21) {
+      continuousAcked = true;  // AA 00 00 21 00 01 00 00 22
     }
     resetFrame();
   }
@@ -186,13 +207,9 @@ void sendSample(bool haveSide, const VL53L4CD_Result_t& side) {
 
 void serviceRunning() {
   const unsigned long now = millis();
+  // A silent laser is left alone: resending the continuous command would
+  // switch continuous mode off on modules that toggle. Z_AGE_MS shows it.
   pollLaser();
-
-  if (now - lastLaserFrameMs >= SCAN_LASER_SILENCE_MS) {
-    Serial1.write(continuousCmd, sizeof(continuousCmd));
-    lastLaserFrameMs = now;  // throttle the retries
-    ++laserRestarts;
-  }
 
   if (now - lastBatteryMs >= SCAN_BATTERY_REPORT_MS) {
     lastBatteryMs = now;
@@ -223,25 +240,87 @@ void serviceRunning() {
   }
 }
 
+// Sends laser off (AfterLaserOff) or the continuous toggle (AfterToggle) and
+// starts watching for readings.
+void beginStopStep(StopStep step, unsigned long now) {
+  stopStep = step;
+  stopStepStart = now;
+  stopQuietSince = now;
+  stopStepAcked = false;
+  laserOffAcked = false;
+  continuousAcked = false;
+  ++stopCommands;
+  if (step == StopStep::AfterLaserOff) {
+    turnLaserOff();
+  } else {
+    Serial1.write(continuousCmd, sizeof(continuousCmd));
+  }
+}
+
+void beginPowerCycle(unsigned long now) {
+  digitalWrite(ENA_PIN, LOW);
+  stopStep = StopStep::EnaLow;
+  stopStepStart = now;
+}
+
+void finishStop(const char* how) {
+  while (Serial1.available()) Serial1.read();
+  resetFrame();
+  phase = Phase::Idle;
+  sendMessage(true).printf("LASER_OFF=%s,COMMANDS=%u\n", how, stopCommands);
+}
+
 void serviceStopping() {
   const unsigned long now = millis();
-  // The first laser off can end continuous mode yet leave the laser lit, so
-  // always send a second one once the stream has had time to stop.
-  if (!secondLaserOffSent && now - stopStartMs >= SECOND_LASER_OFF_MS) {
-    turnLaserOff();
-    secondLaserOffSent = true;
-  }
-  // A measurement well after the laser off command means the module ignored it.
-  if (pollLaser() && now - lastStopCommandMs > STOP_GRACE_MS &&
-      stopAttempts < MAX_STOP_ATTEMPTS) {
-    turnLaserOff();
-    lastStopCommandMs = now;
-    ++stopAttempts;
-  }
-  if (now - lastStopCommandMs >= STOP_CHECK_MS) {
-    while (Serial1.available()) Serial1.read();
-    resetFrame();
-    phase = Phase::Idle;
+  const bool measured = pollLaser();
+  switch (stopStep) {
+    case StopStep::AfterLaserOff:
+    case StopStep::AfterToggle: {
+      const bool acked = stopStep == StopStep::AfterLaserOff ? laserOffAcked : continuousAcked;
+      if (acked && !stopStepAcked) {
+        stopStepAcked = true;
+        stopQuietSince = now;
+      }
+      if (measured) {
+        stopQuietSince = now;
+        // Readings before the acknowledgement were already on their way;
+        // after it, the laser is still measuring, so try the other command.
+        if (stopStepAcked || now - stopStepStart >= STOP_ACK_TIMEOUT_MS) {
+          if (stopCommands >= MAX_STOP_COMMANDS) {
+            beginPowerCycle(now);
+          } else {
+            beginStopStep(stopStep == StopStep::AfterLaserOff ? StopStep::AfterToggle
+                                                              : StopStep::AfterLaserOff, now);
+          }
+          break;
+        }
+      }
+      if (now - stopQuietSince >= STOP_QUIET_MS) {
+        if (stopStep == StopStep::AfterToggle) {
+          // Continuous mode has ended; make sure the laser itself is off too.
+          turnLaserOff();
+          finishStop("TOGGLED");
+        } else {
+          finishStop("LASER_OFF");
+        }
+      }
+      break;
+    }
+    case StopStep::EnaLow:
+      if (now - stopStepStart >= ENA_OFF_MS) {
+        digitalWrite(ENA_PIN, HIGH);
+        stopStep = StopStep::EnaBoot;
+        stopStepStart = now;
+      }
+      break;
+    case StopStep::EnaBoot:
+      // The module restarts with the laser off; send laser off anyway in case
+      // it resumes its previous mode (seen with the first M01).
+      if (now - stopStepStart >= ENA_BOOT_MS) {
+        turnLaserOff();
+        finishStop("POWER_CYCLED");
+      }
+      break;
   }
 }
 
@@ -290,10 +369,8 @@ void startScan() {
   scanStart = now;
   sampleCount = 0;
   tofErrors = 0;
-  laserRestarts = 0;
   lastSampleMs = now;
   lastBatteryMs = now;
-  lastLaserFrameMs = now;
   haveLaserDistance = false;
   laserError = 0;
   sendMessage(true).println("SCAN,STATE=STARTED");
@@ -307,17 +384,13 @@ void stopScan() {
     sendMessage(true).println("No scan is running; laser off sent.");
     return;
   }
-  turnLaserOff();
   if (tofAvailable) tof.VL53L4CD_StopRanging();
   phase = Phase::Stopping;
-  lastStopCommandMs = millis();
-  stopStartMs = lastStopCommandMs;
-  secondLaserOffSent = false;
-  stopAttempts = 0;
-  sendMessage(true).printf("SCAN,STATE=STOPPED,SAMPLES=%lu,TOF_ERRORS=%lu,LASER_RESTARTS=%lu\n",
+  stopCommands = 0;
+  beginStopStep(StopStep::AfterLaserOff, millis());
+  sendMessage(true).printf("SCAN,STATE=STOPPED,SAMPLES=%lu,TOF_ERRORS=%lu\n",
                            static_cast<unsigned long>(sampleCount),
-                           static_cast<unsigned long>(tofErrors),
-                           static_cast<unsigned long>(laserRestarts));
+                           static_cast<unsigned long>(tofErrors));
   playSound(Sound::Success);
 }
 
@@ -331,7 +404,6 @@ void serviceScan() {
         while (Serial1.available()) Serial1.read();
         resetFrame();
         Serial1.write(continuousCmd, sizeof(continuousCmd));
-        lastLaserFrameMs = millis();
         phase = Phase::WaitingForLaser;
         phaseStart = millis();
       }

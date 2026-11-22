@@ -8,7 +8,7 @@ android {
     compileSdk = 37
 
     defaultConfig {
-        applicationId = "me.speleologist.yacsi"
+        applicationId = "me.speleologist.sacsi"
         minSdk = 35
         targetSdk = 37
         versionCode = 1

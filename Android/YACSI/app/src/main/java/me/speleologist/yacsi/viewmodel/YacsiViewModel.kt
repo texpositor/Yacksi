@@ -9,15 +9,10 @@ import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.drop
@@ -31,26 +26,27 @@ import me.speleologist.yacsi.bluetooth.ConnectionState
 import me.speleologist.yacsi.protocol.BatteryMessage
 import me.speleologist.yacsi.protocol.CalMessage
 import me.speleologist.yacsi.protocol.DistanceOffsetMessage
-import me.speleologist.yacsi.protocol.YacsiReading
+import me.speleologist.yacsi.protocol.FirmwareInfo
+import me.speleologist.yacsi.protocol.ScanSample
+import me.speleologist.yacsi.protocol.ScanStateMessage
 import me.speleologist.yacsi.protocol.parseAccelPositionLine
 import me.speleologist.yacsi.protocol.parseBatteryLine
 import me.speleologist.yacsi.protocol.parseCalLine
 import me.speleologist.yacsi.protocol.parseDistanceOffsetLine
-import me.speleologist.yacsi.protocol.parseYacsiLine
-import me.speleologist.yacsi.survey.LrudSide
-import me.speleologist.yacsi.survey.StationLrud
-import me.speleologist.yacsi.survey.SurveyData
-import me.speleologist.yacsi.survey.SurveyLeg
-import me.speleologist.yacsi.survey.SurveyStorage
-import me.speleologist.yacsi.survey.nextStation
-import me.speleologist.yacsi.survey.sanitizeStation
-import me.speleologist.yacsi.survey.stations
+import me.speleologist.yacsi.protocol.parseFirmwareLine
+import me.speleologist.yacsi.protocol.parseScanLine
+import me.speleologist.yacsi.protocol.parseScanStateLine
+import me.speleologist.yacsi.scan.RunCsv
+import me.speleologist.yacsi.scan.RunStorage
+import me.speleologist.yacsi.scan.RunWriter
 import me.speleologist.yacsi.voice.VoiceAction
 import me.speleologist.yacsi.voice.VoiceCommandManager
 import me.speleologist.yacsi.voice.VoiceState
 import java.time.LocalDateTime
-import java.time.temporal.ChronoUnit
 import java.util.Locale
+
+/** Bluetooth name of the SACSI instrument, connected to automatically when paired. */
+const val DEFAULT_DEVICE_NAME = "Sacsi"
 
 enum class AppMode {
     NORMAL,
@@ -103,32 +99,18 @@ data class AccelCalibrationState(
     val isSampling: Boolean = false
 )
 
-/** What the next reading from the device is recorded as. */
-enum class ShotTarget(val label: String, val side: LrudSide?) {
-    LEG("Leg", null),
-    LEFT("L", LrudSide.LEFT),
-    RIGHT("R", LrudSide.RIGHT),
-    UP("U", LrudSide.UP),
-    DOWN("D", LrudSide.DOWN)
-}
-
-data class SurveyState(
-    val fileName: String? = null, // null when no survey is open
-    val legs: List<SurveyLeg> = emptyList(),
-    val atStation: String = "",
-    val toStation: String = "",
-    val lrud: Map<LrudSide, String> = emptyMap(), // the LRUD boxes, for the At station
-    // LRUD at stations with no leg from them yet, kept in step with the boxes and
-    // written to the file as station rows so nothing is lost before the next leg
-    val stationLrud: Map<String, StationLrud> = emptyMap(),
-    val target: ShotTarget = ShotTarget.LEG,
-    val lrudBeforeLeg: Boolean = false, // start each station with L, R, U, D before the leg
+/** The current (or last) side-scan run, from Go to Stop. */
+data class ScanState(
+    val isRunning: Boolean = false, // between the device's STARTED and STOPPED
+    val folderName: String? = null, // null until a folder for run files is chosen
+    val fileName: String? = null, // file of the current or last run; null if not being saved
+    val samples: List<ScanSample> = emptyList(), // oldest first, the most recent MAX_SHOWN_SAMPLES
+    val sampleCount: Int = 0,
+    val missedSamples: Int = 0, // gaps in the device's sample numbers, e.g. Bluetooth dropouts
     val notice: String? = null,
     val noticeIsError: Boolean = false
 ) {
-    val isOpen: Boolean get() = fileName != null
-
-    fun toData() = SurveyData(legs, stationLrud.values.toList())
+    val latest: ScanSample? get() = samples.lastOrNull()
 }
 
 data class YacsiUiState(
@@ -136,26 +118,29 @@ data class YacsiUiState(
     val connectedDeviceName: String? = null,
     val isAutoReconnectEnabled: Boolean = false,
     val appMode: AppMode = AppMode.NORMAL,
-    val latestReading: YacsiReading? = null,
     val rawLogs: List<String> = emptyList(),
     val warningMessage: String? = null,
     val infoMessage: String? = null,
     val shotCalibration: ShotCalibrationState = ShotCalibrationState(),
     val accelCalibration: AccelCalibrationState = AccelCalibrationState(),
     val distanceOffsetMm: Int? = null, // null until the device has reported it
-    val isBatteryLow: Boolean = false, // as of the device's check before the last reading
-    val survey: SurveyState = SurveyState(),
+    val isBatteryLow: Boolean = false, // as of the device's last battery report
+    val firmware: FirmwareInfo? = null, // null until the device has reported it
+    val scan: ScanState = ScanState(),
     val voiceState: VoiceState = VoiceState()
 )
 
 class YacsiViewModel(application: Application) : AndroidViewModel(application) {
     private val bluetoothService = BluetoothService()
-    private val surveyStorage = SurveyStorage(application)
+    private val runStorage = RunStorage(application)
     private val voiceCommandManager = VoiceCommandManager(application)
-    private var surveyUri: Uri? = null
-    private var lrudSaveJob: Job? = null
-    // Serialises survey file writes so they land in order.
-    private val surveyDispatcher = Dispatchers.IO.limitedParallelism(1)
+    private var runFolder: Uri? = runStorage.folderUri()
+
+    // Run file access happens only on this dispatcher, so writes land in order
+    // and runWriter needs no locking.
+    private val runDispatcher = Dispatchers.IO.limitedParallelism(1)
+    private var runWriter: RunWriter? = null
+    private var lastSampleNumber: Int? = null
 
     // Low battery alert; the alarm stream so it is heard even with media muted
     private var batteryToneGenerator: ToneGenerator? = try {
@@ -165,38 +150,32 @@ class YacsiViewModel(application: Application) : AndroidViewModel(application) {
         null
     }
 
-    private val _uiState = MutableStateFlow(
-        YacsiUiState(survey = SurveyState(lrudBeforeLeg = surveyStorage.lrudBeforeLeg))
-    )
+    private val _uiState = MutableStateFlow(YacsiUiState())
     val uiState: StateFlow<YacsiUiState> = _uiState.asStateFlow()
 
     // Short-lived status messages shown as toasts; buffered until the UI collects them
     private val _toasts = Channel<String>(Channel.BUFFERED)
     val toasts: Flow<String> = _toasts.receiveAsFlow()
 
-    // LRUD field the UI should focus next, after a value is entered by voice; dropped
-    // when the survey tab isn't showing, so it doesn't pop up the keyboard later
-    private val _lrudFocusRequests = MutableSharedFlow<LrudSide>(
-        extraBufferCapacity = 1, onBufferOverflow = BufferOverflow.DROP_OLDEST
-    )
-    val lrudFocusRequests: Flow<LrudSide> = _lrudFocusRequests.asSharedFlow()
-
     init {
-        surveyStorage.lastSurveyUri()?.let { openSurvey(it) }
+        runFolder?.let { folder ->
+            viewModelScope.launch {
+                val name = withContext(Dispatchers.IO) { runCatching { runStorage.folderName(folder) }.getOrNull() }
+                updateScan { it.copy(folderName = name) }
+            }
+        }
 
         voiceCommandManager.onCommandRecognized = { action ->
             viewModelScope.launch {
                 when (action) {
-                    VoiceAction.SetTargetLeg -> {
-                        setShotTarget(ShotTarget.LEG)
-                        toast("Voice: shot set to Leg")
+                    VoiceAction.Go -> {
+                        toast("Voice: go")
+                        go()
                     }
-                    VoiceAction.SetTargetSection -> {
-                        setShotTarget(ShotTarget.LEFT)
-                        toast("Voice: shot set to L (section)")
+                    VoiceAction.Stop -> {
+                        toast("Voice: stop")
+                        stop()
                     }
-                    is VoiceAction.SetLrud -> setLrudFromVoice(action.side, action.millimetres)
-                    is VoiceAction.MissingNumber -> toast("Voice: heard ${action.side.label} but no number")
                 }
             }
         }
@@ -218,16 +197,21 @@ class YacsiViewModel(application: Application) : AndroidViewModel(application) {
                 var previous = bluetoothService.connectionState.value
                 bluetoothService.connectionState.collect { state ->
                     _uiState.update { it.copy(connectionState = state) }
-                    val name = _uiState.value.connectedDeviceName ?: "Yacksi"
+                    val name = _uiState.value.connectedDeviceName ?: DEFAULT_DEVICE_NAME
                     // Only announce real transitions; auto-reconnect cycles through CONNECTING quietly
                     if (state == ConnectionState.CONNECTED && previous != ConnectionState.CONNECTED) {
                         toast("Connected to $name")
+                        // Ask which firmware is running so each run file can record it
+                        bluetoothService.sendCommand("V")
                     } else if (state == ConnectionState.DISCONNECTED && previous == ConnectionState.CONNECTED) {
                         toast(if (bluetoothService.isAutoReconnectEnabled.value) "Lost $name, reconnecting…" else "Disconnected")
                     }
                     previous = state
-                    if (state == ConnectionState.DISCONNECTED && !_uiState.value.isAutoReconnectEnabled) {
+                    if (state == ConnectionState.DISCONNECTED && !bluetoothService.isAutoReconnectEnabled.value) {
                         _uiState.update { it.copy(appMode = AppMode.NORMAL) }
+                        // Deliberately disconnected: no more samples will come for this run.
+                        // (While reconnecting the run stays open; sample numbers show the gap.)
+                        if (_uiState.value.scan.isRunning) endRun("Disconnected; run file closed.")
                     }
                 }
             }
@@ -253,7 +237,7 @@ class YacsiViewModel(application: Application) : AndroidViewModel(application) {
     fun autoConnectDefaultDevice() {
         if (_uiState.value.connectionState == ConnectionState.DISCONNECTED && !_uiState.value.isAutoReconnectEnabled) {
             val defaultDevice = bluetoothService.getBondedDevices().firstOrNull {
-                it.name?.equals("Yacksi", ignoreCase = true) == true
+                it.name?.equals(DEFAULT_DEVICE_NAME, ignoreCase = true) == true
             }
             if (defaultDevice != null) {
                 connect(defaultDevice)
@@ -273,17 +257,150 @@ class YacsiViewModel(application: Application) : AndroidViewModel(application) {
         bluetoothService.disconnect(stopAutoReconnect = true)
     }
 
-    fun takeReading() {
-        val state = _uiState.value
-        if (state.connectionState != ConnectionState.CONNECTED) return
+    // --- Side scan ---
+    // Go and Stop ask the device to start or stop; the run itself follows the
+    // device's SCAN,STATE=STARTED / STOPPED lines, so runs started from the
+    // device's button are recorded the same way.
 
-        if (state.appMode != AppMode.NORMAL) {
-            _uiState.update { it.copy(warningMessage = "Cannot take reading while in calibration mode.") }
+    val hasRunFolder: Boolean get() = runFolder != null
+
+    /** Remembers the folder for run files; [thenGo] starts a scan once it is set. */
+    fun setRunFolder(treeUri: Uri, thenGo: Boolean = false) {
+        viewModelScope.launch {
+            try {
+                val name = withContext(Dispatchers.IO) {
+                    runStorage.rememberFolder(treeUri)
+                    runStorage.folderName(treeUri)
+                }
+                runFolder = treeUri
+                updateScan { it.copy(folderName = name, notice = "Runs will be saved in $name.", noticeIsError = false) }
+                if (thenGo) go()
+            } catch (e: Exception) {
+                scanNotice("Could not use that folder: ${e.message}", isError = true)
+            }
+        }
+    }
+
+    fun go() {
+        val state = _uiState.value
+        if (state.connectionState != ConnectionState.CONNECTED) {
+            scanNotice("Not connected to the instrument.", isError = true)
             return
         }
-
-        sendCommand("R", "Take Reading")
+        if (state.appMode != AppMode.NORMAL) {
+            _uiState.update { it.copy(warningMessage = "Finish the calibration before starting a scan.") }
+            return
+        }
+        if (state.scan.isRunning) return
+        sendCommand("G", "Go")
     }
+
+    fun stop() {
+        if (sendCommand("S", "Stop")) return
+        // Not connected, so the device can't be told; stop recording here at least.
+        if (_uiState.value.scan.isRunning) endRun("Stopped while disconnected; the instrument may still be scanning.")
+    }
+
+    private fun handleScanState(message: ScanStateMessage) {
+        when {
+            message.isStarted -> startRun()
+            message.isStopped -> {
+                val problems = listOfNotNull(
+                    message.tofErrors?.takeIf { it > 0 }?.let { "$it side-sensor errors" },
+                    message.laserRestarts?.takeIf { it > 0 }?.let { "$it laser restarts" }
+                )
+                endRun(if (problems.isEmpty()) null else "Instrument reported ${problems.joinToString(", ")}.")
+            }
+        }
+    }
+
+    private fun startRun() {
+        if (_uiState.value.scan.isRunning) endRun(null) // a STOPPED was missed, e.g. in a dropout
+        val start = LocalDateTime.now()
+        val fileName = RunCsv.fileName(start)
+        val folder = runFolder
+        lastSampleNumber = null
+        updateScan {
+            it.copy(
+                isRunning = true,
+                fileName = if (folder != null) fileName else null,
+                samples = emptyList(),
+                sampleCount = 0,
+                missedSamples = 0,
+                notice = if (folder == null) "No folder chosen for run files; this run is not being saved." else null,
+                noticeIsError = folder == null
+            )
+        }
+        if (folder == null) return
+        val header = RunCsv.header(start, _uiState.value.firmware)
+        viewModelScope.launch(runDispatcher) {
+            try {
+                runWriter = runStorage.createRun(folder, fileName).also { it.writeHeader(header) }
+            } catch (e: Exception) {
+                runWriter = null
+                updateScan { it.copy(fileName = null) }
+                scanNotice("Could not create the run file: ${e.message}", isError = true)
+            }
+        }
+    }
+
+    private fun endRun(extraNotice: String?) {
+        val scan = _uiState.value.scan
+        updateScan { it.copy(isRunning = false) }
+        viewModelScope.launch(runDispatcher) {
+            val writer = runWriter ?: run {
+                extraNotice?.let { scanNotice(it, isError = true) }
+                return@launch
+            }
+            runWriter = null
+            val saved = try {
+                writer.close()
+                "Saved ${writer.rows} samples to ${writer.fileName}."
+            } catch (e: Exception) {
+                "Could not finish ${writer.fileName}: ${e.message}"
+            }
+            val missed = if (scan.missedSamples > 0) " ${scan.missedSamples} samples missed." else ""
+            scanNotice(listOfNotNull(saved + missed, extraNotice).joinToString(" "), isError = extraNotice != null)
+        }
+    }
+
+    private fun recordSample(sample: ScanSample) {
+        // Samples with no run open: the app connected while the instrument was
+        // already scanning, so start a run file from here.
+        if (!_uiState.value.scan.isRunning) startRun()
+        val previous = lastSampleNumber
+        val missed = if (previous != null && sample.n > previous + 1) sample.n - previous - 1 else 0
+        lastSampleNumber = sample.n
+        updateScan {
+            it.copy(
+                samples = (it.samples + sample).takeLast(MAX_SHOWN_SAMPLES),
+                sampleCount = it.sampleCount + 1,
+                missedSamples = it.missedSamples + missed
+            )
+        }
+        val row = RunCsv.row(sample, LocalDateTime.now())
+        viewModelScope.launch(runDispatcher) {
+            val writer = runWriter ?: return@launch
+            try {
+                writer.writeRow(row)
+            } catch (e: Exception) {
+                runWriter = null
+                runCatching { writer.close() }
+                updateScan { it.copy(fileName = null) }
+                scanNotice("Writing ${writer.fileName} failed (${e.message}); the rest of this run is not saved.", isError = true)
+            }
+        }
+    }
+
+    private fun scanNotice(message: String, isError: Boolean) {
+        updateScan { it.copy(notice = message, noticeIsError = isError) }
+    }
+
+    private fun updateScan(transform: (ScanState) -> ScanState) {
+        _uiState.update { it.copy(scan = transform(it.scan)) }
+    }
+
+    // --- Rough calibrations ---
 
     fun startAccelCalibration() {
         if (!sendCommand("A", "Rough Accelerometer Calibration")) return
@@ -374,254 +491,6 @@ class YacsiViewModel(application: Application) : AndroidViewModel(application) {
         sendCommand("O$offsetMm", "Set Distance Offset")
     }
 
-    // --- Survey recording ---
-    // Readings arrive whether the device button or the app triggered them; each
-    // is recorded as the current shot target (a leg or one of L/R/U/D).
-
-    fun createSurvey(uri: Uri) {
-        viewModelScope.launch {
-            try {
-                val name = withContext(surveyDispatcher) {
-                    surveyStorage.save(uri, SurveyData())
-                    surveyStorage.remember(uri)
-                    surveyStorage.displayName(uri)
-                }
-                surveyUri = uri
-                updateSurvey {
-                    SurveyState(
-                        fileName = name,
-                        lrudBeforeLeg = it.lrudBeforeLeg,
-                        target = initialTarget(it.lrudBeforeLeg),
-                        notice = "New survey started. Enter the At station."
-                    )
-                }
-            } catch (e: Exception) {
-                surveyNotice("Could not create survey file: ${e.message}", isError = true)
-            }
-        }
-    }
-
-    fun openSurvey(uri: Uri) {
-        viewModelScope.launch {
-            try {
-                val (name, data) = withContext(surveyDispatcher) {
-                    surveyStorage.remember(uri)
-                    surveyStorage.displayName(uri) to surveyStorage.load(uri)
-                }
-                surveyUri = uri
-                val legs = data.legs
-                val stationLrud = data.stationLrud.associateBy { it.station }
-                // Continue from the end of the last leg.
-                val at = legs.lastOrNull()?.to ?: ""
-                updateSurvey {
-                    SurveyState(
-                        fileName = name,
-                        legs = legs,
-                        atStation = at,
-                        toStation = nextStation(at, legs.stations()) ?: "",
-                        lrud = stationLrud[at]?.lrud.toLrudText(),
-                        stationLrud = stationLrud,
-                        lrudBeforeLeg = it.lrudBeforeLeg,
-                        target = initialTarget(it.lrudBeforeLeg),
-                        notice = "${legs.size} legs loaded."
-                    )
-                }
-            } catch (e: Exception) {
-                surveyNotice("Could not open survey file: ${e.message}", isError = true)
-            }
-        }
-    }
-
-    fun setAtStation(text: String) {
-        val at = sanitizeStation(text)
-        updateSurvey {
-            val known = it.legs.stations()
-            val stored = it.stationLrud[at]
-            val moved = if (stored == null && it.atStation !in known) {
-                // A new or mistyped name: the LRUD entered so far moves with it
-                it.copy(atStation = at, stationLrud = it.stationLrud - it.atStation).withLrud(it.lrud)
-            } else {
-                // A real station keeps its LRUD; show what is stored for this one
-                it.copy(atStation = at, lrud = stored?.lrud.toLrudText())
-            }
-            moved.copy(toStation = nextStation(at, known) ?: it.toStation)
-        }
-        scheduleLrudSave()
-    }
-
-    fun setToStation(text: String) {
-        updateSurvey { it.copy(toStation = sanitizeStation(text)) }
-    }
-
-    fun setLrud(side: LrudSide, text: String) {
-        val value = text.filter { it.isDigit() || it == '.' }
-        updateSurvey { it.withLrud(it.lrud + (side to value)) }
-        scheduleLrudSave()
-    }
-
-    fun setShotTarget(target: ShotTarget) {
-        updateSurvey { it.copy(target = target) }
-    }
-
-    fun setLrudBeforeLeg(enabled: Boolean) {
-        surveyStorage.lrudBeforeLeg = enabled
-        updateSurvey { it.copy(lrudBeforeLeg = enabled) }
-    }
-
-    /** Removes the last leg and puts its stations and LRUD back for re-shooting. */
-    fun undoLastLeg() {
-        val survey = _uiState.value.survey
-        val leg = survey.legs.lastOrNull() ?: return
-        val legs = survey.legs.dropLast(1)
-        updateSurvey {
-            it.copy(
-                legs = legs,
-                atStation = leg.from,
-                toStation = leg.to,
-                target = ShotTarget.LEG,
-                notice = "Removed leg ${leg.from} → ${leg.to}.",
-                noticeIsError = false
-            ).withLrud(leg.lrud.toLrudText()) // back to a station row until re-shot
-        }
-        saveSurvey()
-    }
-
-    private fun recordSurveyShot(reading: YacsiReading) {
-        val survey = _uiState.value.survey
-        if (!survey.isOpen) return
-        if (reading.distMm <= 0f) {
-            surveyNotice("Laser shot failed; nothing recorded.", isError = true)
-            return
-        }
-        val distanceM = reading.distMm / 1000.0
-
-        val side = survey.target.side
-        if (side != null) {
-            updateSurvey {
-                it.withLrud(it.lrud + (side to formatMetres(distanceM))).copy(
-                    target = nextTarget(it.target),
-                    notice = "${side.label} ${formatMetres(distanceM)} m at ${it.atStation.ifBlank { "the At station" }}.",
-                    noticeIsError = false
-                )
-            }
-            saveSurvey()
-            return
-        }
-
-        val bearing = reading.bearing
-        if (bearing == null) {
-            surveyNotice("No bearing (check the calibration); leg not recorded.", isError = true)
-            return
-        }
-        if (survey.atStation.isBlank() || survey.toStation.isBlank()) {
-            surveyNotice("Enter the At and To stations; leg not recorded.", isError = true)
-            return
-        }
-
-        val leg = SurveyLeg(
-            from = survey.atStation,
-            to = survey.toStation,
-            distanceM = distanceM,
-            bearing = bearing.toDouble(),
-            inclination = reading.incl.toDouble(),
-            lrud = survey.lrud.parseLrud(),
-            time = now()
-        )
-        val legs = survey.legs + leg
-        updateSurvey {
-            // The leg now carries the LRUD for its From station
-            val stationLrud = it.stationLrud - leg.from
-            it.copy(
-                legs = legs,
-                atStation = leg.to,
-                toStation = nextStation(leg.to, legs.stations()) ?: "",
-                lrud = stationLrud[leg.to]?.lrud.toLrudText(),
-                stationLrud = stationLrud,
-                target = initialTarget(it.lrudBeforeLeg),
-                notice = "Recorded ${leg.from} → ${leg.to}.",
-                noticeIsError = false
-            )
-        }
-        saveSurvey()
-    }
-
-    /** Writes the survey as it is now; saves run in order on [surveyDispatcher]. */
-    private fun saveSurvey() {
-        val uri = surveyUri ?: return
-        lrudSaveJob?.cancel()
-        val data = _uiState.value.survey.toData()
-        viewModelScope.launch {
-            try {
-                withContext(surveyDispatcher) { surveyStorage.save(uri, data) }
-            } catch (e: Exception) {
-                surveyNotice("Could not write survey file: ${e.message}", isError = true)
-            }
-        }
-    }
-
-    /** Saves typed LRUD and station changes once typing pauses, not on every key. */
-    private fun scheduleLrudSave() {
-        lrudSaveJob?.cancel()
-        lrudSaveJob = viewModelScope.launch {
-            delay(1000)
-            saveSurvey()
-        }
-    }
-
-    /** Sets the LRUD boxes and keeps the stored LRUD for the At station in step with them. */
-    private fun SurveyState.withLrud(lrud: Map<LrudSide, String>): SurveyState {
-        val values = lrud.parseLrud()
-        val stations = when {
-            atStation.isBlank() -> stationLrud
-            values.isEmpty() -> stationLrud - atStation
-            else -> stationLrud + (atStation to StationLrud(atStation, values, now()))
-        }
-        return copy(lrud = lrud, stationLrud = stations)
-    }
-
-    private fun Map<LrudSide, String>.parseLrud(): Map<LrudSide, Double> =
-        mapNotNull { (side, text) -> text.toDoubleOrNull()?.let { side to it } }.toMap()
-
-    private fun Map<LrudSide, Double>?.toLrudText(): Map<LrudSide, String> =
-        this?.mapValues { (_, metres) -> formatMetres(metres) } ?: emptyMap()
-
-    private fun now() = LocalDateTime.now().truncatedTo(ChronoUnit.SECONDS).toString()
-
-    private fun initialTarget(lrudBeforeLeg: Boolean) =
-        if (lrudBeforeLeg) ShotTarget.LEFT else ShotTarget.LEG
-
-    /** L -> R -> U -> D -> leg, the order LRUD shots are taken in. */
-    private fun nextTarget(target: ShotTarget) =
-        if (target == ShotTarget.DOWN) ShotTarget.LEG else ShotTarget.entries[target.ordinal + 1]
-
-    /** Voice-entered LRUD; the value is spoken in millimetres. */
-    private fun setLrudFromVoice(side: LrudSide, millimetres: Int) {
-        if (!_uiState.value.survey.isOpen) {
-            toast("Voice: ${side.label} ignored, no survey open")
-            return
-        }
-        updateSurvey {
-            it.withLrud(it.lrud + (side to formatMetres(millimetres / 1000.0))).copy(
-                // Keep shot target in step, as if this side had been shot with the laser
-                target = if (it.target.side == side) nextTarget(it.target) else it.target
-            )
-        }
-        saveSurvey()
-        toast("Voice: ${side.label} $millimetres mm")
-        // D wraps round to L
-        _lrudFocusRequests.tryEmit(LrudSide.entries[(side.ordinal + 1) % LrudSide.entries.size])
-    }
-
-    private fun formatMetres(metres: Double) = "%.2f".format(Locale.US, metres)
-
-    private fun surveyNotice(message: String, isError: Boolean) {
-        updateSurvey { it.copy(notice = message, noticeIsError = isError) }
-    }
-
-    private fun updateSurvey(transform: (SurveyState) -> SurveyState) {
-        _uiState.update { it.copy(survey = transform(it.survey)) }
-    }
-
     fun sendHelp() {
         bluetoothService.sendCommand("?")
     }
@@ -660,7 +529,26 @@ class YacsiViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun handleReceivedLine(line: String) {
+        // Samples arrive four times a second; keep them out of the log, which
+        // is for everything else the device says.
+        val sample = parseScanLine(line)
+        if (sample != null) {
+            recordSample(sample)
+            return
+        }
         appendLog(line)
+
+        val scanState = parseScanStateLine(line)
+        if (scanState != null) {
+            handleScanState(scanState)
+            return
+        }
+
+        val firmware = parseFirmwareLine(line)
+        if (firmware != null) {
+            _uiState.update { it.copy(firmware = firmware) }
+            return
+        }
 
         val cal = parseCalLine(line)
         if (cal != null) {
@@ -693,13 +581,6 @@ class YacsiViewModel(application: Application) : AndroidViewModel(application) {
                 )
             }
             return
-        }
-
-        // Check if line is a sensor reading
-        val reading = parseYacsiLine(line)
-        if (reading != null) {
-            _uiState.update { it.copy(latestReading = reading) }
-            recordSurveyShot(reading)
         }
 
         // The rough accelerometer/magnetometer calibrations only report in free text.
@@ -802,10 +683,12 @@ class YacsiViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /** The device checks the battery before every reading, from its button or the app. */
+    /** The device reports the battery at Go and every 30 s during a scan. */
     private fun handleBatteryMessage(message: BatteryMessage) {
+        val wasLow = _uiState.value.isBatteryLow
         _uiState.update { it.copy(isBatteryLow = message.isLow) }
-        if (!message.isLow) return
+        // Alert when it first goes low, not on every report during a long run
+        if (!message.isLow || wasLow) return
         batteryToneGenerator?.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 1000)
         val volts = "%.2f V".format(Locale.US, message.millivolts / 1000.0)
         _uiState.update {
@@ -842,7 +725,13 @@ class YacsiViewModel(application: Application) : AndroidViewModel(application) {
         voiceCommandManager.destroy()
         batteryToneGenerator?.release()
         batteryToneGenerator = null
+        // Close any open run file; everything written so far is already flushed.
+        runWriter?.let { runCatching { it.close() } }
         super.onCleared()
         bluetoothService.disconnect()
+    }
+
+    private companion object {
+        const val MAX_SHOWN_SAMPLES = 2000
     }
 }

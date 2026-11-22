@@ -12,6 +12,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import me.speleologist.yacsi.viewmodel.DEFAULT_DEVICE_NAME
 
 @SuppressLint("MissingPermission")
 @Composable
@@ -21,7 +22,7 @@ fun PairedDevicesDialog(
     onDismiss: () -> Unit
 ) {
     val sortedDevices = bondedDevices.sortedByDescending { 
-        it.name?.equals("Yacksi", ignoreCase = true) == true 
+        it.name?.equals(DEFAULT_DEVICE_NAME, ignoreCase = true) == true 
     }
 
     AlertDialog(
@@ -31,7 +32,7 @@ fun PairedDevicesDialog(
             Column(modifier = Modifier.fillMaxWidth().heightIn(max = 300.dp)) {
                 if (sortedDevices.isEmpty()) {
                     Text(
-                        "No paired Bluetooth devices found.\nPlease pair 'Yacksi' in Android Bluetooth settings first.",
+                        "No paired Bluetooth devices found.\nPlease pair 'Sacsi' in Android Bluetooth settings first.",
                         style = MaterialTheme.typography.bodyMedium,
                         modifier = Modifier.padding(vertical = 16.dp)
                     )
@@ -44,14 +45,14 @@ fun PairedDevicesDialog(
                     LazyColumn(modifier = Modifier.fillMaxWidth()) {
                         items(sortedDevices) { device ->
                             val deviceName = device.name ?: "Unknown Device"
-                            val isYacksi = deviceName.equals("Yacksi", ignoreCase = true)
+                            val isDefault = deviceName.equals(DEFAULT_DEVICE_NAME, ignoreCase = true)
                             
                             Card(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .padding(vertical = 4.dp)
                                     .clickable { onDeviceSelected(device) },
-                                colors = if (isYacksi) {
+                                colors = if (isDefault) {
                                     CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
                                 } else {
                                     CardDefaults.cardColors()
@@ -65,9 +66,9 @@ fun PairedDevicesDialog(
                                 ) {
                                     Column(modifier = Modifier.weight(1f)) {
                                         Text(
-                                            text = deviceName + if (isYacksi) " (Default)" else "",
-                                            fontWeight = if (isYacksi) FontWeight.Bold else FontWeight.Normal,
-                                            color = if (isYacksi) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface
+                                            text = deviceName + if (isDefault) " (Default)" else "",
+                                            fontWeight = if (isDefault) FontWeight.Bold else FontWeight.Normal,
+                                            color = if (isDefault) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface
                                         )
                                         Spacer(modifier = Modifier.height(2.dp))
                                         Text(

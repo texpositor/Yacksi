@@ -156,3 +156,119 @@ fun parseYacsiLine(line: String): YacsiReading? {
         return null
     }
 }
+
+// --- SACSI side scan ---
+
+/** How far a side (VL53L4CD) distance can be trusted, from its range status. */
+enum class SideQuality {
+    GOOD,      // status 0
+    DOUBTFUL,  // status 1-2 (sigma or signal warning) with a distance
+    INVALID,   // status 3 or above, or a zero distance: logged but not shown
+    NONE       // no side reading in this sample
+}
+
+/**
+ * One side-scan sample from the device:
+ * `SCAN,N=12,T=3010,Z_MM=2343,Z_AGE_MS=120,LASER_ERR=0,Y_MM=845,Y_STATUS=0,
+ *  HEADING=123.4,YINCL=-1.2,TILT=2.8,AX=..,AY=..,AZ=..,MX=..,MY=..,MZ=..,CAL=SHOT`
+ * Z is the latest laser distance (down), Y the side distance; blank values
+ * mean no reading and `nan` an undefined angle.
+ */
+data class ScanSample(
+    val n: Int,
+    val tMs: Long,
+    val zMm: Int?,
+    val zAgeMs: Int?,
+    val laserError: Int,
+    val yMm: Int?,
+    val yStatus: Int?,
+    val heading: Float?,
+    val yIncl: Float?,
+    val tilt: Float?,
+    val ax: Int?,
+    val ay: Int?,
+    val az: Int?,
+    val mx: Int?,
+    val my: Int?,
+    val mz: Int?,
+    val calibration: String?,
+    val rawLine: String
+) {
+    val sideQuality: SideQuality
+        get() = when {
+            yMm == null || yStatus == null -> SideQuality.NONE
+            yMm <= 0 || yStatus >= 3 -> SideQuality.INVALID
+            yStatus == 0 -> SideQuality.GOOD
+            else -> SideQuality.DOUBTFUL
+        }
+}
+
+fun parseScanLine(line: String): ScanSample? {
+    if (!line.startsWith("SCAN,")) return null
+    val fields = parseFields(line)
+    val n = fields["N"]?.toIntOrNull() ?: return null
+    fun int(key: String) = fields[key]?.toIntOrNull()
+    fun angle(key: String) = fields[key]?.toFloatOrNull()?.takeIf { !it.isNaN() }
+    return ScanSample(
+        n = n,
+        tMs = fields["T"]?.toLongOrNull() ?: 0L,
+        zMm = int("Z_MM"),
+        zAgeMs = int("Z_AGE_MS"),
+        laserError = int("LASER_ERR") ?: 0,
+        yMm = int("Y_MM"),
+        yStatus = int("Y_STATUS"),
+        heading = angle("HEADING"),
+        yIncl = angle("YINCL"),
+        tilt = angle("TILT"),
+        ax = int("AX"),
+        ay = int("AY"),
+        az = int("AZ"),
+        mx = int("MX"),
+        my = int("MY"),
+        mz = int("MZ"),
+        calibration = fields["CAL"],
+        rawLine = line
+    )
+}
+
+/**
+ * Scan start/stop announcements:
+ * `SCAN,STATE=STARTED` and `SCAN,STATE=STOPPED,SAMPLES=<n>,TOF_ERRORS=<n>,LASER_RESTARTS=<n>`.
+ */
+data class ScanStateMessage(
+    val state: String,
+    val samples: Int?,
+    val tofErrors: Int?,
+    val laserRestarts: Int?
+) {
+    val isStarted: Boolean get() = state == "STARTED"
+    val isStopped: Boolean get() = state == "STOPPED"
+}
+
+fun parseScanStateLine(line: String): ScanStateMessage? {
+    if (!line.startsWith("SCAN,")) return null
+    val fields = parseFields(line)
+    val state = fields["STATE"] ?: return null
+    return ScanStateMessage(
+        state = state,
+        samples = fields["SAMPLES"]?.toIntOrNull(),
+        tofErrors = fields["TOF_ERRORS"]?.toIntOrNull(),
+        laserRestarts = fields["LASER_RESTARTS"]?.toIntOrNull()
+    )
+}
+
+/** Firmware identity: `FIRMWARE=SACSI,VERSION=0.1.0,BUILD=2026-11-18 21:14:34,GIT=50151fa`. */
+data class FirmwareInfo(val name: String, val version: String, val build: String, val git: String) {
+    val summary: String get() = "$name $version ($build, $git)"
+}
+
+fun parseFirmwareLine(line: String): FirmwareInfo? {
+    if (!line.startsWith("FIRMWARE=")) return null
+    val fields = parseFields(line)
+    return FirmwareInfo(
+        name = fields["FIRMWARE"] ?: return null,
+        version = fields["VERSION"] ?: "",
+        build = fields["BUILD"] ?: "",
+        git = fields["GIT"] ?: ""
+    )
+}
